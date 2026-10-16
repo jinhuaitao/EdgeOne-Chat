@@ -41,6 +41,9 @@ MODEL_1   = deepseek-chat:DeepSeek Chat, deepseek-reasoner:DeepSeek R1
 
 > 存储**无需配任何变量**：Blob 命名空间默认 `edgeone-chat`，自动创建。
 
+`API_KEY_1` 想填多个 key 时用英文逗号分隔（`sk-a,sk-b`），撞上失效/限流的 key 会自动换一个
+重试，详见第二节 [🔑 多密钥](#-多密钥key-池)。
+
 ### 4. 验证
 
 访问 `/healthz`：
@@ -53,8 +56,9 @@ MODEL_1   = deepseek-chat:DeepSeek Chat, deepseek-reasoner:DeepSeek R1
 - `storage: memory` —— **未接通**，聊天可用，但 Telegram / 知识库 / 长期记忆重启即丢
 
 排障时加 `STORAGE_DEBUG=1` 重新部署，再看 `/healthz` 的 `debug` 字段
-（`provision.state` 应为 `ready`，`lastStorageError` 应为 `null`）；
-`?probe=1` 会做一次真实读写验证。详见[第四节](#四存储)。
+（`provision.state` 应为 `ready`，`lastStorageError` 应为 `null`，
+`keyPool` 是各 key 的掩码与冷却状态）；`?probe=1` 会做一次真实读写验证。
+详见[第四节](#四存储)。
 
 ### 5. 预创建 Blob 命名空间（可选，推荐）
 
@@ -97,9 +101,45 @@ https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的EdgeOne域
 | 变量 | 说明 |
 |---|---|
 | `API_URL_1` ⭐ | 通道 1 的接口地址，如 `https://api.deepseek.com/v1/chat/completions`（可继续配 `_2`、`_3`…多通道；也支持不带数字后缀的 `API_URL` / `API_KEY` / `MODEL` 写法） |
-| `API_KEY_1` ⭐ | 通道 1 的密钥 |
+| `API_KEY_1` ⭐ | 通道 1 的密钥。**支持英文逗号填多个**（`sk-a,sk-b,sk-c`）组成 key 池，详见下方「🔑 多密钥」 |
 | `MODEL_1` ⭐ | 模型列表，格式 `模型ID:显示名`，多个用英文逗号分隔，如 `deepseek-chat:DeepSeek Chat, deepseek-reasoner:DeepSeek R1` |
 | `MAX_TOKENS` | 单次回复最大 token，默认 `4096` |
+| `API_KEY_ROTATE` | 设 `0` 关掉「失败换 key 重试」，退回「一次请求一个 key」的老行为。默认开启 |
+
+### 🔑 多密钥（key 池）
+
+`API_KEY_1` 允许填**多个 key**，用英文逗号分隔。适合「同一家服务商的多个账号 / 多份额度」，
+用来摊平单个 key 的 RPM、TPM 限制：
+
+```
+API_URL_1 = https://api.deepseek.com/v1/chat/completions
+API_KEY_1 = sk-aaa, sk-bbb, sk-ccc
+MODEL_1   = deepseek-chat:DeepSeek Chat
+```
+
+`API_CONFIG` 的 JSON 写法同样支持，且 `keys` 可以直接给**数组** ——
+**key 里本身含英文逗号时只能用这种写法**（逗号分隔的形式无法表达）：
+
+```
+API_CONFIG = [{"url":"https://api.deepseek.com/v1/chat/completions",
+               "keys":["sk-aaa","sk-bbb"],
+               "models":"deepseek-chat:DeepSeek Chat"}]
+```
+
+运行时行为：
+
+| 环节 | 行为 |
+|---|---|
+| 选取 | 每个请求**随机**挑一个健康的 key（不是轮询，也没有会话粘性） |
+| 失败重试 | 只在 `401`（密钥无效）/ `402`（欠费）/ `403`（无权限或被封）/ `429`（限流）时换一个 key 重试；单次请求最多试 3 个 key |
+| 不重试 | `400` 参数错误、`404` 地址错误、`5xx` 上游故障、以及网络超时 —— 换 key 都治不了，重试只会翻倍延迟 |
+| 熔断 | 连续失败的 key 按指数退避进入冷却（30 秒起，最长 10 分钟），冷却期内不再被优先选中；成功一次立刻恢复 |
+| Agent 模式 | 循环的**每一步**都重新选 key，同一轮对话可能用到不同 key |
+| 同名模型 | 同一模型 ID 写在多个通道、且 `API_URL` 相同时，key 池会**合并去重** |
+| 多服务商 | ⚠️ key 池绑定在同一个 `API_URL_i` 上。要接不同厂商请另开通道（`API_URL_2 / API_KEY_2 / MODEL_2`，支持到 `_20`） |
+
+排障：设 `STORAGE_DEBUG=1` 后访问 `/healthz`，`debug.keyPool` 会列出每个模型下各 key 的
+连续失败次数、上次状态码与剩余冷却时间（**只回显掩码 `***abcd`，不输出 key 原文**）。
 
 ### 🔐 访问与安全
 
@@ -130,7 +170,7 @@ https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的EdgeOne域
 | `EO_BLOB_NAMESPACE` | `edgeone-chat` | Blob 命名空间名，首次使用自动创建（只允许字母/数字/下划线/连字符，UTF-8 ≤ 64 字节） |
 | `BLOB_CONSISTENCY` | `strong` | 读取一致性。**建议别动**：SDK 默认 `eventual` 会导致「刚写完读不到」（随机失忆、刚转存的图片 404） |
 | `BLOB_AUTOPROVISION` | `1` | 首个请求时自动创建并校验命名空间。设 `0` 关闭（冷启动零写入） |
-| `STORAGE_DEBUG` | 不输出 | 设 `1` 后 `/healthz` 附带后端探测详情；再加 `?probe=1` 真实读写一次 |
+| `STORAGE_DEBUG` | 不输出 | 设 `1` 后 `/healthz` 附带排障详情（存储后端 + `keyPool` 密钥池状态）；再加 `?probe=1` 真实读写一次 |
 | `EO_BLOB_BINDING` | 不填 | 逃生口：注入自建 Store 实例（一般不需要） |
 | `EO_KV_BINDING` | 自动发现 | 仅 `STORAGE_BACKEND=kv` 时有意义；任意绑定名都能被自动识别 |
 
@@ -279,6 +319,7 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 | `blobError` | Blob 为什么没接上（最常见是依赖没装上） |
 | `lastStorageError` | 最近一次读写错误的 `op` / `code` / `message` / `hint`。**很关键**：上层把异常当「读不到」处理，「配额满了」会伪装成「知识库是空的」，这里把它摊开 |
 | `mode` | 回显 `STORAGE_BACKEND` 原始取值（拼错时给 `warning`） |
+| `keyPool` | 每个模型下各 key 的掩码、连续失败次数、上次状态码与剩余冷却毫秒数。**不回显 key 原文** |
 
 **默认关闭**，避免对外暴露内部信息。
 
@@ -314,6 +355,8 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 | 14 | 全局 | 更名 `cloudflare-chat` → `edgeone-chat`（包名、标题、品牌、PWA、UA、命名空间） |
 | 15 | `_app/telegram/diag.js`、`setup.js` | 新增：`/tg-setup` 自诊断端点 + 进程内事件留痕（`setWebhook` 成功 ≠ 链路可用，原实现全分支回 200 导致配置错了完全静默） |
 
+| 16 | `_app/channel.js`、`entry.js`、`agent/loop.js`、`telegram/handler.js` | **多密钥加固**：新增密钥池健康状态 + 失败换 key 重试（仅 `401/402/403/429`）+ 指数退避熔断；未配置密钥时不再发送畸形的 `Authorization: Bearer `（兼容 Ollama 等免密钥网关）；同名模型在同一 `API_URL` 下合并密钥池；`/healthz` 增 `keyPool` 掩码排障 |
+
 **其余 40 个文件（UI、PWA、SSRF 防护、Agent 循环、工具链、Telegram 处理器）均为原样复制。**
 
 ---
@@ -336,6 +379,11 @@ curl -i -X POST https://<你的域名>/tg-webhook \
    `/tg-setup` 的 `diag.lastError`）。唯一例外：请求体不是合法 JSON 时回 500（调用方问题，重试安全）。
 9. **`_app/` 不参与路由**依赖平台对下划线前缀的忽略规则；即使被生成路由也只影响 `/_app/*`，不影响功能。
 10. **图像接口是同步的**：生成期间前端一直显示「正在生成」，属正常；只做转存+渲染，无缩略图/压缩。
+11. **key 池不跨服务商**：多个 key 必须属于同一个 `API_URL_i`，跨厂商要另开通道。另外
+    逗号分隔的写法无法表达「key 本身含逗号」，这种极少数情况请用 `API_CONFIG` 的
+    `keys` 数组写法。
+12. **熔断状态是进程内的**：冷却记录存在函数实例内存里，实例回收后重置；多实例部署时
+    各实例的冷却进度不共享（但重试本身每个实例都会做，不影响最终可用性）。
 
 ---
 
@@ -347,11 +395,14 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 node scripts/selfcheck.mjs      # 或 npm run selfcheck
 ```
 
-覆盖 **127 项用例**：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
+覆盖 **148 项用例**：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
 是否真带上）、错误可见性（`QUOTA_EXCEEDED` 记录但不破坏上层）、KV key 编码、
 路由、模型解析、Blob 默认后端与命名空间自动创建、KV 绑定自动发现、
 `/healthz` 排障输出、生图链路（含 5 种响应形态）、页面内联脚本合法性、
 品牌改名断言（15 个关键文件不许再出现 `cloudflare`）、浏览器键名迁移行为测试、
+密钥池（多 key 解析与合并、401/429 换 key 重试、400/5xx/网络异常不重试、
+指数退避冷却、冷却后不再被选中、尝试次数上限、掩码不回显原文、
+`API_KEY_ROTATE=0` 逃生口、端到端 401 自愈与免密钥请求头）、
 Telegram 自诊断（含「无模型时仍对 Telegram 回 200」「白名单拦下记录真实 chat_id」
 等静默契约断言）、双后端端到端（记忆/知识库/检索各跑一遍）。
 
@@ -373,6 +424,11 @@ Telegram 自诊断（含「无模型时仍对 Telegram 回 200」「白名单拦
 | 改名后 PWA 图标名还是旧的 | 需重新「添加到主屏幕」；改名前的旧前缀缓存不会自动清，可手动清一次浏览器缓存 |
 | 想用 KV 但一直是 `memory` | KV 需三步：控制台开通 → 建命名空间 → 绑定到项目；且 **KV 仅 Edge Functions 可用**，默认 Cloud Functions 请用 Blob；另需显式设 `STORAGE_BACKEND=kv`（不自动降级） |
 | 页面提示「未配置模型」 | 变量没配或没重部署；`MODEL_1` 格式是 `模型ID:显示名`，多个用英文逗号分隔 |
+| 配了多个 key 仍偶尔报 401/429 | 已内置换 key 重试（单次最多试 3 个）。仍频繁报错说明可用 key 不够：`STORAGE_DEBUG=1` 看 `/healthz` 的 `debug.keyPool`，看哪个 key 在冷却、上次是什么状态码 |
+| 想临时关掉换 key 重试 | 设 `API_KEY_ROTATE=0` 重新部署 |
+| key 里本身含英文逗号 | 逗号分隔的写法无法表达，改用 `API_CONFIG` 的 `keys` 数组写法（见第二节 🔑 多密钥） |
+| 只配 `API_URL` 不配 `API_KEY` 报 401 | 现在**不会再发送** `Authorization` 头（兼容 Ollama 等免密钥网关）；仍报 401 说明该上游确实需要密钥，补上 `API_KEY_1` |
+| 多 key 想用在**不同**服务商上 | 不行：key 池绑定同一个 `API_URL_i`。请用 `API_URL_2 / API_KEY_2 / MODEL_2` 另开通道 |
 | Telegram 不响应 | 先看 `/tg-setup?key=<TG_SETUP_KEY>` 的 `topHint`（见第三节） |
 | Agent 长任务中途中断 | `edgeone.json` 里 `maxDuration` 被改小，保持 120；`WEB_AGENT_TIMEOUT_MS` ≤ 120000 |
 | 文档列表体积都显示 1 KB | 预期行为，见第六节第 1 条 |

@@ -12,7 +12,7 @@ import { CORS_HEADERS, TEXT_HEADERS, HTML_HEADERS, SSE_HEADERS, PNG_HEADERS,
   MANIFEST_HEADERS, SW_HEADERS, HEALTH_HEADERS, APP_VERSION, imgHeaders } from './constants.js';
 import { denyUnauthorized } from './auth.js';
 import { hitRateLimit } from './rate-limit.js';
-import { getChannelConfig, buildAIRequest } from './channel.js';
+import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders, keyPoolStatus } from './channel.js';
 import { readErrorBody } from './agent/stability.js';
 import { handleWebAgent } from './web-agent.js';
 import { handleTgWebhook } from './telegram/handler.js';
@@ -97,6 +97,9 @@ async function routeRequest(request, env, ctx) {
         if (url.searchParams.get('probe') === '1') {
           try { debug.probe = await probeStore(); } catch (e) {}
         }
+        // 密钥池状态：多 key 时哪个 key 正在冷却、上次失败是什么状态码。
+        // 只回显掩码（***abcd），绝不输出 key 原文。
+        try { debug.keyPool = keyPoolStatus(env); } catch (e) {}
         payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
@@ -135,7 +138,7 @@ async function routeRequest(request, env, ctx) {
           return new Response(JSON.stringify({ error: aiConfig.error }), { status: 500, headers: CORS_HEADERS });
         }
 
-        const { apiUrl, currentApiKey, payload, isImageAPI } = aiConfig;
+        const { payload, isImageAPI } = aiConfig;
 
         // Web 端 Agent 模式 —— 复用 Telegram 同一套 ReAct 循环 + 工具链，
         // 进度通过 SSE 事件推送。Web 端对知识库只读（kbReadOnly: true），优先检索知识库文档。
@@ -143,14 +146,13 @@ async function routeRequest(request, env, ctx) {
           return await handleWebAgent(env, body);
         }
 
-        const upstreamResponse = await fetch(apiUrl, {
+        // 多 key 场景：401/402/403/429 会自动换一个 key 重试（见 channel.js 密钥池）。
+        // 未配置密钥时不发送 Authorization 头（兼容 Ollama 之类免密钥网关）。
+        const { resp: upstreamResponse } = await fetchWithKeyRotation(aiConfig, (key) => ({
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${currentApiKey}`,
-            'Content-Type': 'application/json',
-          },
+          headers: authHeaders(key),
           body: JSON.stringify(payload)
-        });
+        }));
 
         if (!upstreamResponse.ok) {
           // 错误正文限长读取 —— 上游偶发返回超大 HTML 错误页时不再整段读入

@@ -1,6 +1,6 @@
 // Telegram Agent 主循环：自主规划 → 工具调用 → 汇总作答（_worker.js 原第 1311-1344,1468-1704 行）
 
-import { buildAIRequest } from '../channel.js';
+import { buildAIRequest, fetchWithKeyRotation, authHeaders } from '../channel.js';
 import { parseDSMLToolCalls, stripDSMLBlocks } from './dsml.js';
 import { truncateToolResult, readErrorBody, toolCallSignature, trimAgentMessages } from './stability.js';
 import { agentLimits, describeToolCall } from './limits.js';
@@ -30,13 +30,15 @@ async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget
   if (cfg.error) return null;
   let resp;
   try {
-    const remainMs = Math.max(0, deadline - Date.now());
-    resp = await fetch(cfg.apiUrl, {
+    // 收尾这一枪同样走密钥池轮换：401/402/403/429 时换一个 key 再试，
+    // 免得前面几步都跑完了，最后一步因为撞上一个失效 key 而白费。
+    const r = await fetchWithKeyRotation(cfg, (key) => ({
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
+      headers: authHeaders(key),
       body: JSON.stringify(cfg.payload),
-      signal: AbortSignal.timeout(Math.max(8000, Math.min(60000, remainMs)))
-    });
+      signal: AbortSignal.timeout(Math.max(8000, Math.min(60000, deadline - Date.now())))
+    }));
+    resp = r.resp;
   } catch (e) { return null; }
   if (!resp.ok) { try { await resp.body.cancel(); } catch (e) {} return null; }
   let msg;
@@ -150,13 +152,15 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     let resp;
     try {
-      const remainMs = Math.max(0, deadline - Date.now());
-      resp = await fetch(cfg.apiUrl, {
+      // 密钥池轮换：多 key 时若撞上失效/被限流的 key，自动换一个重试
+      // （buildInit 每次尝试都会被重新调用，所以超时信号按当次剩余预算重算）
+      const r = await fetchWithKeyRotation(cfg, (key) => ({
         method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
+        headers: authHeaders(key),
         body: JSON.stringify(cfg.payload),
-        signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
-      });
+        signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, deadline - Date.now())))
+      }));
+      resp = r.resp;
     } catch (e) {
       const nm = e && e.name ? String(e.name) : '';
       const msg = String((e && e.message) || '');

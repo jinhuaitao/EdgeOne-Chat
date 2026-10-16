@@ -3,7 +3,7 @@
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
-import { getChannelConfig, buildAIRequest } from '../channel.js';
+import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentGetMemories, agentForgetMemory } from '../agent/memory.js';
 import { agentGetMode, agentSetMode } from '../agent/mode.js';
@@ -485,19 +485,18 @@ export async function handleTgWebhook(request, env) {
               await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ ' + aiConfig.error });
               return;
             }
-            const { apiUrl, currentApiKey, payload } = aiConfig;
+            const { payload } = aiConfig;
             let aiResponse = null;
             for (let tgAttempt = 1; tgAttempt <= 2; tgAttempt++) {
               try {
-                aiResponse = await fetch(apiUrl, {
+                // 密钥池轮换：多 key 时撞上失效/被限流的 key 会自动换一个重试
+                const r = await fetchWithKeyRotation(aiConfig, (key) => ({
                   method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${currentApiKey}`,
-                    'Content-Type': 'application/json',
-                  },
+                  headers: authHeaders(key),
                   body: JSON.stringify(payload),
                   signal: AbortSignal.timeout(60000)
-                });
+                }));
+                aiResponse = r.resp;
                 break;
               } catch (e) {
                 aiResponse = null;

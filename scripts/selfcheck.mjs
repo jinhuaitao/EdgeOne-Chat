@@ -323,6 +323,307 @@ async function main() {
     assert.match(html, /通义千问 Plus/);
   });
 
+  console.log('\n=== 4b. 密钥池：多 key 轮换、失败换 key 重试、短期熔断 ===');
+  const chan = await import('../cloud-functions/_app/channel.js');
+
+  // 假 fetch：记录每次请求实际带上的 Authorization 头，便于断言「换了 key」
+  function installFetchMock(handler) {
+    const orig = globalThis.fetch;
+    const calls = [];
+    globalThis.fetch = async (url, init) => {
+      const h = (init && init.headers) || {};
+      const auth = h.Authorization || h.authorization || '';
+      calls.push({ url: String(url), auth: auth });
+      return handler({ url: String(url), auth: auth, n: calls.length });
+    };
+    return { calls: calls, restore() { globalThis.fetch = orig; } };
+  }
+
+  function chatEnv(apiKey, extra) {
+    return Object.assign({
+      STORAGE_BACKEND: 'none',
+      API_URL_1: 'https://api.example.com/v1/chat/completions',
+      API_KEY_1: apiKey,
+      MODEL_1: 'm1:模型一',
+    }, extra || {});
+  }
+
+  function chatCfg(env) {
+    return chan.buildAIRequest(env, 'm1', [{ role: 'user', content: 'hi' }], true);
+  }
+
+  await checkAsync('API_KEY_1 逗号分隔的多个 key 全部进入密钥池（去空格、丢空项）', () => {
+    const env = chatEnv('sk-a, sk-b ,sk-c,,');
+    const cfg = chatCfg(env);
+    assert.deepEqual(cfg.keys, ['sk-a', 'sk-b', 'sk-c']);
+    assert.equal(cfg.hasKey, true);
+  });
+
+  await checkAsync('authHeaders：未配置密钥时不带 Authorization 头（兼容免密钥网关）', () => {
+    assert.equal(chan.authHeaders('').Authorization, undefined);
+    assert.equal(chan.authHeaders('').Authorization, undefined);
+    assert.equal(chan.authHeaders('sk-x').Authorization, 'Bearer sk-x');
+  });
+
+  await checkAsync('同一个模型写在两个通道、地址相同时合并密钥池（原来直接丢弃）', () => {
+    const env = {
+      STORAGE_BACKEND: 'none',
+      API_URL_1: 'https://a.example/v1/chat/completions', API_KEY_1: 'sk-1',
+      MODEL_1: 'gpt-4o:GPT-4o',
+      API_URL_2: 'https://a.example/v1/chat/completions', API_KEY_2: 'sk-2, sk-3',
+      MODEL_2: 'gpt-4o:GPT-4o',
+    };
+    const cfg = chan.buildAIRequest(env, 'gpt-4o', [{ role: 'user', content: 'hi' }], true);
+    assert.deepEqual(cfg.keys, ['sk-1', 'sk-2', 'sk-3']);
+  });
+
+  await checkAsync('同一个模型但地址不同时不合并（保留第一个通道，避免串了接口）', () => {
+    const env = {
+      STORAGE_BACKEND: 'none',
+      API_URL_1: 'https://a.example/v1/chat/completions', API_KEY_1: 'sk-1',
+      MODEL_1: 'gpt-4o:GPT-4o',
+      API_URL_2: 'https://b.example/v1/chat/completions', API_KEY_2: 'sk-2',
+      MODEL_2: 'gpt-4o:GPT-4o',
+    };
+    const cfg = chan.buildAIRequest(env, 'gpt-4o', [{ role: 'user', content: 'hi' }], true);
+    assert.deepEqual(cfg.keys, ['sk-1']);
+    assert.equal(cfg.apiUrl, 'https://a.example/v1/chat/completions');
+  });
+
+  await checkAsync('API_CONFIG 的 keys 支持数组写法（key 里含逗号也能配）', () => {
+    const env = {
+      STORAGE_BACKEND: 'none',
+      API_CONFIG: JSON.stringify([
+        { url: 'https://a.example/v1/chat/completions', keys: ['sk,with,commas', 'sk-plain'], models: 'm1:模型一' },
+      ]),
+    };
+    const cfg = chatCfg(env);
+    assert.deepEqual(cfg.keys, ['sk,with,commas', 'sk-plain']);
+  });
+
+  await checkAsync('只配一个 key 时不会产生多余的重试请求', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-solo'));
+    const m = installFetchMock(() => new Response('nope', { status: 401 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.attempts, 1);
+      assert.equal(m.calls.length, 1);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('撞上失效 key 时自动换一个并最终成功（多 key 的核心收益）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-bad-1, sk-good-1'));
+    const m = installFetchMock(({ auth }) => auth.indexOf('sk-bad-1') !== -1
+      ? new Response('invalid api key', { status: 401 })
+      : new Response('{"ok":true}', { status: 200 }));
+    try {
+      for (let i = 0; i < 6; i++) {
+        const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+        assert.equal(r.resp.status, 200, '第 ' + (i + 1) + ' 次应最终成功');
+        assert.equal(r.key, 'sk-good-1', '最终应落在可用的 key 上');
+      }
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('429 限流同样会换 key 重试（多 key 就是为了分散单 key 配额）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-429-a, sk-429-b'));
+    const m = installFetchMock(({ n }) => n === 1
+      ? new Response('rate limited', { status: 429 })
+      : new Response('{"ok":true}', { status: 200 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.resp.status, 200);
+      assert.equal(r.attempts, 2);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('400 参数错误不换 key 重试（换 key 治不了参数问题）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-400-a, sk-400-b, sk-400-c'));
+    const m = installFetchMock(() => new Response('bad request', { status: 400 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.resp.status, 400);
+      assert.equal(r.attempts, 1);
+      assert.equal(m.calls.length, 1);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('5xx 上游故障不换 key 重试（所有 key 会一起挂，重试只是浪费额度）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-500-a, sk-500-b, sk-500-c'));
+    const m = installFetchMock(() => new Response('upstream boom', { status: 503 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.attempts, 1);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('网络层异常不换 key 重试（换 key 治不了网络问题，只会把一次超时变两次）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-net-a, sk-net-b, sk-net-c'));
+    const m = installFetchMock(() => { throw new Error('ECONNRESET'); });
+    let threw = false;
+    try {
+      await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+    } catch (e) { threw = true; }
+    finally { m.restore(); }
+    assert.equal(threw, true, '网络异常应原样抛出，交给调用方的超时/暂停逻辑');
+    assert.equal(m.calls.length, 1, '不该换 key 重试');
+  });
+
+  await checkAsync('所有 key 都失败时把最后一次的错误交回调用方（不吞错、且每个 key 只试一次）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-all-a, sk-all-b'));
+    const m = installFetchMock(() => new Response('nope', { status: 401 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.resp.status, 401);
+      assert.equal(r.attempts, 2);
+      const used = m.calls.map(c => c.auth);
+      assert.equal(new Set(used).size, 2, '两次尝试必须用不同的 key');
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('单次请求最多尝试 3 个 key（key 再多也不会无限重试）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-m1, sk-m2, sk-m3, sk-m4, sk-m5'));
+    const m = installFetchMock(() => new Response('nope', { status: 401 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.attempts, 3);
+      assert.equal(m.calls.length, 3);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('buildInit 每次尝试都被重新调用（超时按当次剩余预算重算，而非共用首次 deadline）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-b-init-a, sk-b-init-b, sk-b-init-c'));
+    const m = installFetchMock(() => new Response('nope', { status: 401 }));
+    let built = 0;
+    try {
+      await chan.fetchWithKeyRotation(cfg, (k) => {
+        built++;
+        return { method: 'POST', headers: chan.authHeaders(k), signal: AbortSignal.timeout(1000) };
+      });
+    } finally { m.restore(); }
+    assert.equal(built, 3);
+    assert.equal(built, m.calls.length);
+  });
+
+  await checkAsync('连续失败的 key 进入冷却期（熔断），排障输出可见', async () => {
+    chan.__resetKeyHealth();
+    const env = chatEnv('sk-cool-a');
+    const cfg = chatCfg(env);
+    const m = installFetchMock(() => new Response('nope', { status: 401 }));
+    try {
+      for (let i = 0; i < 2; i++) {
+        await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      }
+    } finally { m.restore(); }
+    const status = chan.keyPoolStatus(env);
+    const h = status[0].health[0];
+    assert.equal(h.failStreak, 2, '连续失败次数应被记录');
+    assert.equal(h.lastStatus, 401);
+    assert.ok(h.cooldownMs > 0, '应处于冷却期');
+  });
+
+  await checkAsync('冷却中的 key 不再被优先选中（有健康 key 时完全不碰它）', async () => {
+    chan.__resetKeyHealth();
+    const env = chatEnv('sk-hot-a, sk-hot-b');
+    const cfg = chatCfg(env);
+    const m = installFetchMock(({ auth }) => auth.indexOf('sk-hot-a') !== -1
+      ? new Response('nope', { status: 401 })
+      : new Response('{"ok":true}', { status: 200 }));
+    try {
+      for (let i = 0; i < 3; i++) {
+        await chan.fetchWithKeyRotation({ url: cfg.apiUrl, keys: ['sk-hot-a'], keyRotate: true },
+          (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      }
+      m.calls.length = 0;
+      for (let i = 0; i < 10; i++) {
+        await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      }
+      const used = m.calls.map(c => c.auth);
+      assert.ok(used.length > 0);
+      assert.ok(used.every(a => a.indexOf('sk-hot-b') !== -1),
+        '冷却中的 key 不该再被选中，实际用了: ' + used.join(','));
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('API_KEY_ROTATE=0 时退回单次尝试（不换 key 重试的逃生口）', async () => {
+    chan.__resetKeyHealth();
+    const cfg = chatCfg(chatEnv('sk-r1, sk-r2', { API_KEY_ROTATE: '0' }));
+    assert.equal(cfg.keyRotate, false);
+    const m = installFetchMock(() => new Response('nope', { status: 401 }));
+    try {
+      const r = await chan.fetchWithKeyRotation(cfg, (k) => ({ method: 'POST', headers: chan.authHeaders(k) }));
+      assert.equal(r.attempts, 1);
+      assert.equal(m.calls.length, 1);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('密钥池排障只输出掩码，绝不回显 key 原文', () => {
+    chan.__resetKeyHealth();
+    const env = chatEnv('sk-secret-abcdefgh');
+    const json = JSON.stringify(chan.keyPoolStatus(env));
+    assert.equal(json.indexOf('sk-secret-abcdefgh'), -1, '不得出现 key 原文');
+    assert.ok(json.indexOf('***efgh') !== -1, '应给出掩码');
+  });
+
+  await checkAsync('STORAGE_DEBUG=1 时 /healthz 附带密钥池状态（掩码）', async () => {
+    chan.__resetKeyHealth();
+    const env = chatEnv('sk-hz-1234, sk-hz-5678', { STORAGE_DEBUG: '1' });
+    const res = await mod.handle({ request: new Request('https://example.com/healthz'), env, waitUntil: () => {} });
+    const j = await res.json();
+    assert.ok(Array.isArray(j.debug.keyPool), 'debug.keyPool 应是数组');
+    assert.equal(j.debug.keyPool[0].keys, 2);
+    assert.equal(JSON.stringify(j.debug.keyPool).indexOf('sk-hz-1234'), -1);
+  });
+
+  await checkAsync('端到端：/api/chat 撞上失效 key 会自动换 key 并正常返回（含逗号后空格）', async () => {
+    chan.__resetKeyHealth();
+    const env = chatEnv('sk-dead-e2e, sk-live-e2e');
+    const m = installFetchMock(({ auth }) => auth.indexOf('sk-dead-e2e') !== -1
+      ? new Response(JSON.stringify({ error: { message: 'invalid key' } }), { status: 401 })
+      : new Response('data: {"choices":[{"delta":{"content":"你好"}}]}\n\ndata: [DONE]\n\n', { status: 200 }));
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'm1', messages: [{ role: 'user', content: 'hi' }] }),
+        }),
+        env, waitUntil: () => {},
+      });
+      assert.equal(res.status, 200, '换 key 后应正常返回，而不是把 401 抛给用户');
+      assert.match(await res.text(), /你好/);
+      assert.ok(m.calls.length >= 1 && m.calls.length <= 2);
+      assert.ok(m.calls[m.calls.length - 1].auth.indexOf('sk-live-e2e') !== -1);
+    } finally { m.restore(); }
+  });
+
+  await checkAsync('端到端：未配置 API_KEY 时不发送 Authorization 头（兼容 Ollama 等免密钥网关）', async () => {
+    const env = { STORAGE_BACKEND: 'none', API_URL_1: 'https://local.example/v1/chat/completions', MODEL_1: 'llama3:本地模型' };
+    const m = installFetchMock(() => new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 }));
+    try {
+      const res = await mod.handle({
+        request: new Request('https://example.com/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'llama3', messages: [{ role: 'user', content: 'hi' }] }),
+        }),
+        env, waitUntil: () => {},
+      });
+      assert.equal(res.status, 200);
+      assert.equal(m.calls.length, 1);
+      assert.equal(m.calls[0].auth, '', '未配置密钥时不该出现 Authorization 头');
+    } finally { m.restore(); }
+  });
+
   console.log('\n=== 5. 端到端：挂上存储后端后，知识库与长期记忆真的落盘并能读回 ===');
   // 这一段验证的是「原项目那 8 个直接调用 env.R2 的文件一行都没改，也能正常工作」
   const r2 = await import('../cloud-functions/_app/store/r2.js');
