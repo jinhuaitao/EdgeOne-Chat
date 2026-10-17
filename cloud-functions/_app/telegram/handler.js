@@ -65,6 +65,98 @@ function parseCommand(t) {
   return { cmd: m[1].toLowerCase(), rest: (m[2] || '').trim() };
 }
 
+// 群组 @ 提及与引用回复识别缓存（key: bot token -> lowercase username）
+const botUsernameCache = new Map();
+const KNOWN_TG_COMMANDS = new Set(['/start', '/model', '/clear', '/new', '/help', '/memory', '/kb', '/forget', '/agent']);
+
+function extractBotIdFromToken(token) {
+  const t = String(token || '').trim();
+  const colon = t.indexOf(':');
+  return colon > 0 ? t.slice(0, colon) : '';
+}
+
+function escapeRegExp(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function resolveBotUsername(env, tgApi) {
+  const configured = String((env && env.TG_BOT_USERNAME) || '').trim().replace(/^@+/, '').toLowerCase();
+  if (configured) return configured;
+  const token = String((env && env.TG_BOT_TOKEN) || '').trim();
+  if (!token) return '';
+  if (botUsernameCache.has(token)) return botUsernameCache.get(token);
+  try {
+    const res = await tgApi('getMe', {});
+    if (res && res.ok) {
+      const data = await res.json();
+      const uname = String((data && data.result && data.result.username) || '').trim().replace(/^@+/, '').toLowerCase();
+      if (uname) {
+        botUsernameCache.set(token, uname);
+        return uname;
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+
+// 判断群组消息是否触发机器人（支持 @bot_username 提及、回复机器人消息、以及 /命令）
+async function evaluateGroupTrigger(msg, env, tgApi) {
+  const chatType = String((msg && msg.chat && msg.chat.type) || '');
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (!isGroup || String((env && env.TG_GROUP_REPLY_ALL) || '') === '1') {
+    return { isGroup, triggered: true, botUsername: '', cleanText: (s) => String(s || '') };
+  }
+
+  const botId = extractBotIdFromToken(env && env.TG_BOT_TOKEN);
+  const rawText = typeof msg.text === 'string' ? msg.text : (typeof msg.caption === 'string' ? msg.caption : '');
+  const entities = Array.isArray(msg.entities)
+    ? msg.entities
+    : (Array.isArray(msg.caption_entities) ? msg.caption_entities : []);
+
+  const replyMsg = msg.reply_to_message;
+  const isTopicHeader = !!(replyMsg && replyMsg.forum_topic_created && !replyMsg.text && !replyMsg.caption);
+  const replyFrom = !isTopicHeader && replyMsg ? replyMsg.from : null;
+
+  let isReplyToBot = !!(botId && replyFrom && String(replyFrom.id) === botId);
+  let isTextMentionToBot = !!(botId && entities.some(e => e && e.type === 'text_mention' && e.user && String(e.user.id) === botId));
+
+  const cmdMatch = /^(\/[a-zA-Z]+)(?:@([a-zA-Z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(rawText.trim());
+  const isKnownCmd = !!(cmdMatch && KNOWN_TG_COMMANDS.has(cmdMatch[1].toLowerCase()));
+  const cmdTarget = cmdMatch && cmdMatch[2] ? cmdMatch[2].toLowerCase() : '';
+
+  let botUsername = '';
+  if (rawText.indexOf('@') !== -1 || (replyFrom && replyFrom.is_bot && !isReplyToBot)) {
+    botUsername = await resolveBotUsername(env, tgApi);
+  }
+
+  if (!isReplyToBot && botUsername && replyFrom && String(replyFrom.username || '').toLowerCase() === botUsername) {
+    isReplyToBot = true;
+  }
+
+  let isCommandForBot = false;
+  if (isKnownCmd) {
+    if (!cmdTarget) isCommandForBot = true;
+    else if (botUsername && cmdTarget === botUsername) isCommandForBot = true;
+    else if (!botUsername) isCommandForBot = true;
+  }
+
+  let isUsernameMentioned = false;
+  if (botUsername && rawText) {
+    const mentionRe = new RegExp('(?:^|[^a-zA-Z0-9_])@' + escapeRegExp(botUsername) + '(?![a-zA-Z0-9_])', 'i');
+    if (mentionRe.test(rawText)) isUsernameMentioned = true;
+  }
+
+  const triggered = isReplyToBot || isTextMentionToBot || isCommandForBot || isUsernameMentioned;
+  const cleanText = (s) => {
+    const str = String(s || '');
+    if (!botUsername || isCommandForBot) return str;
+    const stripRe = new RegExp('@' + escapeRegExp(botUsername) + '(?![a-zA-Z0-9_])\\s*', 'ig');
+    return str.replace(stripRe, '').trim();
+  };
+
+  return { isGroup, triggered, botUsername, cleanText };
+}
+
 // v6.9.5：长消息按 3980 字符切分，自动闭合跨分片的 ``` 代码块
 function splitTelegramMarkdown(text, maxLength = 3980) {
   const chunks = [];
@@ -234,8 +326,27 @@ export async function handleTgWebhook(request, env) {
           return;
         }
 
+        // 群组场景（group / supergroup）：默认仅在 @机器人、回复机器人消息或发送命令时触发
+        const groupCheck = await evaluateGroupTrigger(msg, env, tgApi);
+        if (groupCheck.isGroup && !groupCheck.triggered) {
+          tgNote('skip', {
+            reason: 'group_not_mentioned',
+            updateId: update.update_id,
+            chatId: chatId,
+            chatType: msg.chat.type,
+            detail: '群聊消息未 @ 机器人且未回复机器人，已忽略（如需群内全量接话可设 TG_GROUP_REPLY_ALL=1）',
+          });
+          return;
+        }
+        const replyMsgParams = (groupCheck.isGroup && msg.message_id)
+          ? { reply_to_message_id: msg.message_id, allow_sending_without_reply: true }
+          : {};
+
         // 提取消息内容：支持纯文本、文本文档直传（.md/.txt/.csv/.json/代码）、图片（Vision 多模态）
-        let userText = typeof msg.text === 'string' ? msg.text : '';
+        let userText = typeof msg.text === 'string' ? groupCheck.cleanText(msg.text) : '';
+        if (groupCheck.isGroup && typeof msg.text === 'string' && msg.text.trim() && !userText) {
+          userText = '你好';
+        }
         let multimodalContent = null;
         let historyUserText = userText;
 
@@ -257,7 +368,7 @@ export async function handleTgWebhook(request, env) {
             if (docText.length > 60000) {
               docText = docText.slice(0, 60000) + '\n\n…（文件较长，已截取前 60000 字符）';
             }
-            const caption = String(msg.caption || '').trim() || '请阅读并总结这份文档的核心内容；如果我要求保存到知识库，请调用 save_doc 工具。';
+            const caption = groupCheck.cleanText(msg.caption || '') || '请阅读并总结这份文档的核心内容；如果我要求保存到知识库，请调用 save_doc 工具。';
             userText = `【上传文件：《${fileName}》】\n用户说明：${caption}\n\n文件内容如下：\n\`\`\`\n${docText}\n\`\`\``;
             historyUserText = `【上传文件：《${fileName}》】${caption}`;
           } catch (e) {
@@ -271,7 +382,7 @@ export async function handleTgWebhook(request, env) {
             const picked = candidates.length ? candidates[candidates.length - 1] : msg.photo[msg.photo.length - 1];
             const bytes = await tgFetchFileBytes(env, picked.file_id, 2 * 1024 * 1024, tgApiTimeoutMs);
             const dataUrl = 'data:image/jpeg;base64,' + uint8ToBase64(bytes);
-            const caption = String(msg.caption || '').trim() || '请详细查看并分析这张图片的内容。';
+            const caption = groupCheck.cleanText(msg.caption || '') || '请详细查看并分析这张图片的内容。';
             userText = caption;
             historyUserText = '[图片] ' + caption;
             multimodalContent = [
@@ -402,11 +513,11 @@ export async function handleTgWebhook(request, env) {
           }
 
           const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-          const pendingMsgPromise = tgApi('sendMessage', {
+          const pendingMsgPromise = tgApi('sendMessage', Object.assign({
             chat_id: chatId,
             text: "⏳ _正在思考并生成内容，请稍候..._",
             parse_mode: "Markdown"
-          }).then(async res => {
+          }, replyMsgParams)).then(async res => {
             if (res.ok) {
               const data = await res.json();
               return data.result?.message_id;
@@ -548,9 +659,10 @@ export async function handleTgWebhook(request, env) {
             const sendReplyChunk = async (text, useMarkdown) => {
               for (let attempt = 1; attempt <= 2; attempt++) {
                 try {
-                  const r = await tgApi('sendMessage', useMarkdown
-                    ? { chat_id: chatId, text, parse_mode: "Markdown" }
-                    : { chat_id: chatId, text });
+                  const r = await tgApi('sendMessage', Object.assign(
+                    useMarkdown ? { chat_id: chatId, text, parse_mode: "Markdown" } : { chat_id: chatId, text },
+                    replyMsgParams
+                  ));
                   if (r.ok || attempt === 2) return r;
                 } catch (e) {
                   if (attempt === 2) return { ok: false };

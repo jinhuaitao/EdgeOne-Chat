@@ -161,6 +161,8 @@ API_CONFIG = [{"url":"https://api.deepseek.com/v1/chat/completions",
 | `TG_API_TIMEOUT_MS` | 调用 Telegram API 超时，默认 `15000` |
 | `TG_WEBHOOK_BUDGET_MS` | 单次 webhook 内 Agent 循环的时间预算，默认 `55000`（Cloud Functions 上限 120s，取值 10000~240000） |
 | `TG_HISTORY_ROUNDS` | Telegram 对话保留的上下文轮数，默认 `10` |
+| `TG_BOT_USERNAME` | 机器人用户名（可选，不填则首次收到群 `@` 消息时自动调 `getMe` 识别并缓存） |
+| `TG_GROUP_REPLY_ALL` | 群聊默认仅在 `@机器人`、回复机器人消息或发 `/` 命令时触发；设 `1` 改为群内全量接话 |
 
 ### 🗄️ 存储（Blob / KV）
 
@@ -221,6 +223,12 @@ MODEL_1   = sensenova-u1.5-fast:日日新 U1.5 Fast
 ---
 
 ## 三、Telegram 机器人
+
+### 群组 `@` 回复设置
+
+1. **在 `@BotFather` 关闭隐私模式**：向 [@BotFather](https://t.me/BotFather) 发送 `/setjoingroups` 设为 `Enable`，再发送 `/setprivacy` 设为 **`Disable`**（否则 Telegram 官方不会把群内普通 `@` 消息推给 Webhook）。若机器人已在群里，修改后需**移出群组重新拉入**（或直接把机器人设为群管理员）方能生效。
+2. **获取负数群 ID 并加入白名单**：把机器人拉入群聊随便发一条消息，访问 `https://<你的域名>/tg-setup?key=<TG_SETUP_KEY>`，从 `topHint` 复制带负号的群 `chat_id`（如 `-1001234567890`），填入环境变量 `TG_ALLOWED_CHAT_IDS`（多个 ID 用英文逗号分隔）并重新部署。
+3. **群内触发方式**：群聊默认仅在 **`@机器人用户名` 提问**、**引用回复（Reply）机器人的消息** 或 **发送 `/start`、`/model`、`/clear` 等命令** 时触发，并自动引用原消息回复；群友日常闲聊会自动静默忽略（记录为 `group_not_mentioned`）。
 
 ### 排查顺序（机器人不响应时）
 

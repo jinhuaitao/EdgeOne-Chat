@@ -232,6 +232,8 @@ function localConfig(e, allowedIds, models, tokenInfo) {
       TG_PUBLIC_BASE_URL: e.TG_PUBLIC_BASE_URL || null,
       TG_HISTORY_ROUNDS: e.TG_HISTORY_ROUNDS || null,
       TG_WEBHOOK_BUDGET_MS: e.TG_WEBHOOK_BUDGET_MS || null,
+      TG_BOT_USERNAME: e.TG_BOT_USERNAME || null,
+      TG_GROUP_REPLY_ALL: e.TG_GROUP_REPLY_ALL || null,
     },
     models: models.map(m => m.id),
     modelCount: models.length,

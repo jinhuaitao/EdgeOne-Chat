@@ -1919,6 +1919,38 @@ async function main() {
     assert.match(swMod.SW_JS, /url\.pathname === '\/tg-setup'/);
   });
 
+  await checkAsync('群聊默认仅在 @机器人 或引用回复时触发，普通闲聊记录 group_not_mentioned 并忽略', async () => {
+    diag.tgReset();
+    const calls = stubTelegramFetch({});
+    try {
+      const env = Object.assign({ STORAGE_BACKEND: 'none', TG_BOT_TOKEN: FAKE_TOKEN, TG_ALLOWED_CHAT_IDS: '-100888' }, TG_MODELS);
+      await tgWebhookCall(env, {
+        update_id: 901,
+        message: { message_id: 10, chat: { id: -100888, type: 'supergroup' }, from: { id: 1, is_bot: false }, text: '群里普通闲聊' },
+      });
+      const snap1 = diag.tgSnapshot();
+      assert.equal(snap1.events[0].reason, 'group_not_mentioned', '未 @ 机器人的群消息应被忽略');
+      assert.equal(calls.some(c => c.method === 'sendMessage'), false, '不应发送任何回复');
+
+      diag.tgReset();
+      await tgWebhookCall(env, {
+        update_id: 902,
+        message: { message_id: 11, chat: { id: -100888, type: 'supergroup' }, from: { id: 1, is_bot: false }, text: '/help@other_bot' },
+      });
+      assert.equal(diag.tgSnapshot().events[0].reason, 'group_not_mentioned', '发给其他机器人的命令应被忽略');
+
+      diag.tgReset();
+      await tgWebhookCall(env, {
+        update_id: 903,
+        message: { message_id: 12, chat: { id: -100888, type: 'supergroup' }, from: { id: 1, is_bot: false }, text: '/help@my_test_bot' },
+      });
+      assert.equal(diag.tgSnapshot().events[0].reason, 'command', '发给本机器人的命令应正常触发');
+    } finally {
+      restoreFetch();
+      diag.tgReset();
+    }
+  });
+
   await checkAsync('事件环形缓冲有上限（isolate 常驻也不会无限增长）', () => {
     diag.tgReset();
     const total = diag.MAX_EVENTS + 25;
