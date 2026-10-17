@@ -1951,6 +1951,147 @@ async function main() {
     }
   });
 
+  console.log('\n=== 13. Agent 性能加速与 19 项零密钥工具自检 ===');
+
+  const agentToolsMod = await import('../cloud-functions/_app/agent/tools.js');
+  const toolsLocalMod = await import('../cloud-functions/_app/agent/tools-local.js');
+  const toolsWebMod = await import('../cloud-functions/_app/agent/tools-web.js');
+  const limitsMod = await import('../cloud-functions/_app/agent/limits.js');
+
+  await checkAsync('Agent 工具箱共注册 19 项工具（Web 只读模式自动过滤 4 项写入工具剩 15 项）', () => {
+    const allTools = agentToolsMod.getAgentTools(false);
+    const roTools = agentToolsMod.getAgentTools(true);
+    assert.equal(allTools.length, 19);
+    assert.equal(roTools.length, 15);
+    const names = allTools.map(t => t.function.name);
+    for (const expected of ['unit_convert', 'text_toolkit', 'network_lookup', 'github_lookup', 'arxiv_search', 'trending_news']) {
+      assert.ok(names.includes(expected), '应包含新工具 ' + expected);
+      assert.match(limitsMod.describeToolCall(expected, { query: 'q', target: 't', value: 1, from: 'km', to: 'mi' }), /正在/);
+    }
+  });
+
+  await checkAsync('科学/统计计算器扩展：支持 sum/avg/median/std/gcd/lcm/fact/comb/perm 与常量 tau/phi', () => {
+    assert.equal(toolsLocalMod.toolCalculate('sum(1, 2, 3, 4, 5)'), '计算结果：15');
+    assert.equal(toolsLocalMod.toolCalculate('avg(10, 20, 30)'), '计算结果：20');
+    assert.equal(toolsLocalMod.toolCalculate('median(1, 99, 7, 10)'), '计算结果：8.5');
+    assert.equal(toolsLocalMod.toolCalculate('gcd(48, 18, 30)'), '计算结果：6');
+    assert.equal(toolsLocalMod.toolCalculate('lcm(4, 6, 8)'), '计算结果：24');
+    assert.equal(toolsLocalMod.toolCalculate('fact(6)'), '计算结果：720');
+    assert.equal(toolsLocalMod.toolCalculate('comb(10, 3)'), '计算结果：120');
+    assert.equal(toolsLocalMod.toolCalculate('perm(5, 2)'), '计算结果：20');
+    assert.equal(toolsLocalMod.toolCalculate('round(tau / pi, 4)'), '计算结果：2');
+  });
+
+  await checkAsync('全能单位换算与大整数进制转换（unit_convert）精确无误', () => {
+    assert.match(toolsLocalMod.toolUnitConvert({ value: 100, from: 'C', to: 'F' }), /212 °F/);
+    assert.match(toolsLocalMod.toolUnitConvert({ value: 1, from: 'km', to: 'm' }), /1000 m/);
+    assert.match(toolsLocalMod.toolUnitConvert({ value: 2, from: 'GB', to: 'MB' }), /2048 MB/);
+    assert.match(toolsLocalMod.toolUnitConvert({ value: 'FF', base_from: 16, base_to: 10 }), /255（10 进制）/);
+    assert.match(toolsLocalMod.toolUnitConvert({ value: 42, from: 'dec', to: 'bin' }), /101010（2 进制）/);
+  });
+
+  await checkAsync('文本与编码工具箱（text_toolkit）：字数统计、SHA-256、Base64、URL 编解码与 UUID', async () => {
+    const st = await toolsLocalMod.toolTextToolkit({ action: 'stats', text: '你好 EdgeOne 123\n第二行' });
+    assert.match(st, /中文汉字数：5/);
+    assert.match(st, /英文单词数：1/);
+    assert.match(st, /行数：2/);
+
+    const h = await toolsLocalMod.toolTextToolkit({ action: 'hash', text: 'abc', algorithm: 'SHA-256' });
+    assert.match(h, /ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad/);
+
+    const b64 = await toolsLocalMod.toolTextToolkit({ action: 'base64_encode', text: 'EdgeOne 智能助手' });
+    const encoded = b64.split('\n').pop().trim();
+    const dec = await toolsLocalMod.toolTextToolkit({ action: 'base64_decode', text: encoded });
+    assert.match(dec, /EdgeOne 智能助手/);
+
+    const uuids = await toolsLocalMod.toolTextToolkit({ action: 'uuid', count: 3 });
+    assert.equal((uuids.match(/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi) || []).length, 3);
+  });
+
+  await checkAsync('新联网工具（github_lookup / arxiv_search / trending_news / network_lookup）解析与返回格式正常', async () => {
+    agentToolsMod.clearAgentToolCache();
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('api.github.com/repos/owner/repo/releases/latest')) {
+        return new Response(JSON.stringify({ tag_name: 'v2.5.0', published_at: '2026-10-01T00:00:00Z' }), { status: 200 });
+      }
+      if (u.includes('api.github.com/repos/owner/repo')) {
+        return new Response(JSON.stringify({
+          full_name: 'owner/repo', html_url: 'https://github.com/owner/repo',
+          description: 'Fast AI Agent', stargazers_count: 8888, forks_count: 666,
+          open_issues_count: 12, language: 'JavaScript', license: { spdx_id: 'MIT' },
+          pushed_at: '2026-10-15T00:00:00Z', topics: ['ai', 'agent']
+        }), { status: 200 });
+      }
+      if (u.includes('export.arxiv.org')) {
+        const xml = `<feed><entry><id>http://arxiv.org/abs/2610.00001v1</id><published>2026-10-10T00:00:00Z</published><title>Fast Edge Agent Architecture</title><summary>We propose a fast agent loop.</summary><author><name>Alice</name></author></entry></feed>`;
+        return new Response(xml, { status: 200 });
+      }
+      if (u.includes('hacker-news.firebaseio.com/v0/topstories.json')) {
+        return new Response(JSON.stringify([101]), { status: 200 });
+      }
+      if (u.includes('hacker-news.firebaseio.com/v0/item/101.json')) {
+        return new Response(JSON.stringify({ id: 101, title: 'EdgeOne AI Released', score: 350, descendants: 88, url: 'https://example.org/news' }), { status: 200 });
+      }
+      if (u.includes('ipwho.is/8.8.8.8')) {
+        return new Response(JSON.stringify({
+          success: true, ip: '8.8.8.8', country: 'United States', region: 'California', city: 'Mountain View',
+          latitude: 37.386, longitude: -122.0838,
+          connection: { asn: 15169, org: 'Google LLC', isp: 'Google' },
+          timezone: { id: 'America/Los_Angeles', utc: '-07:00' }
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+    try {
+      const gh = await toolsWebMod.toolGithubLookup({ query: 'owner/repo' });
+      assert.match(gh, /8888 Stars/);
+      assert.match(gh, /v2.5.0/);
+
+      const ax = await toolsWebMod.toolArxivSearch({ query: 'edge agent' });
+      assert.match(ax, /Fast Edge Agent Architecture/);
+      assert.match(ax, /Alice/);
+
+      const hn = await toolsWebMod.toolTrendingNews({ source: 'hn', count: 1 });
+      assert.match(hn, /EdgeOne AI Released/);
+      assert.match(hn, /350 pts/);
+
+      const net = await toolsLocalMod.toolNetworkLookup({ target: '8.8.8.8' });
+      assert.match(net, /AS15169/);
+      assert.match(net, /Mountain View/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('性能优化：L1 工具结果缓存、同参并发去重、以及 web_fetch 翻页零网络开销缓存', async () => {
+    agentToolsMod.clearAgentToolCache();
+    let fetchCount = 0;
+    const longHtml = '<html><body><h1>Title</h1><p>' + 'A'.repeat(4500) + '</p><p>' + 'B'.repeat(4500) + '</p></body></html>';
+    globalThis.fetch = async () => {
+      fetchCount++;
+      await new Promise(r => setTimeout(r, 20));
+      return new Response(longHtml, { status: 200, headers: { 'Content-Type': 'text/html' } });
+    };
+    try {
+      // 1) 并发发起两个完全相同的 web_fetch 调用 → 应合并为 1 次底层请求
+      const [r1, r2] = await Promise.all([
+        agentToolsMod.execAgentTool('web_fetch', { url: 'https://example.com/long-doc', offset: 0 }, {}, 'c1', false),
+        agentToolsMod.execAgentTool('web_fetch', { url: 'https://example.com/long-doc', offset: 0 }, {}, 'c1', false),
+      ]);
+      assert.equal(r1, r2);
+      assert.equal(fetchCount, 1, '同参并发调用应只触发 1 次网络请求');
+
+      // 2) 翻页续读 offset=6000 → 命中 L1 页面缓存，不触发新的网络请求
+      const rPage2 = await agentToolsMod.execAgentTool('web_fetch', { url: 'https://example.com/long-doc', offset: 6000 }, {}, 'c1', false);
+      assert.equal(fetchCount, 1, 'web_fetch 传 offset 翻页应直接命中 L1 正文缓存，零网络请求');
+      assert.match(rPage2, /B{50}/);
+    } finally {
+      restoreFetch();
+      agentToolsMod.clearAgentToolCache();
+    }
+  });
+
   await checkAsync('事件环形缓冲有上限（isolate 常驻也不会无限增长）', () => {
     diag.tgReset();
     const total = diag.MAX_EVENTS + 25;

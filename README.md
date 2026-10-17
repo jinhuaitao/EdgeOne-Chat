@@ -4,7 +4,7 @@
 运行时用 **Cloud Functions (Node.js 20)**，持久化用 **Blob 存储**。
 由上游原版 v7.0.0（跑在 Cloudflare Workers + R2 上）完整移植而来。
 
-✨ 多通道 AI 对话 · PWA · 语音朗读 · Agent 模式（13 个零密钥工具）·
+✨ 多通道 AI 对话 · PWA · 语音朗读 · Agent 模式（19 个零密钥工具 · L1 缓存加速）·
 知识库 2.0（长期记忆 + 文档精读 + 全文检索）· Telegram 机器人
 
 ---
@@ -219,6 +219,7 @@ MODEL_1   = sensenova-u1.5-fast:日日新 U1.5 Fast
 | `AGENT_CONTEXT_BUDGET` | `24000` | 上下文预算（token） |
 | `AGENT_TOOL_TIMEOUT_MS` | `30000` | 单个工具调用超时 |
 | `AGENT_STREAM_UPSTREAM` | — | Agent 是否流式透传上游输出 |
+| `AGENT_TOOL_CACHE` | `1` | 只读工具 L1 内存 TTL 缓存与同参并发去重（默认开启，设 `0` 关闭） |
 
 ---
 

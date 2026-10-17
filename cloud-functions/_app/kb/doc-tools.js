@@ -5,6 +5,44 @@ import { kbSafeChatId } from '../store/kb.js';
 import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
   kbSaveRegistry, kbFindRegEntry, kbFmtSize, kbFmtDate } from './registry.js';
 
+// L1 文档正文短期缓存（绑定当前 env.R2 实例，60s TTL，最多缓存 50 篇），
+// 加速长文档 offset 連続翻页与多关键词全文检索，写删操作自动失效对应条目。
+const KB_BODY_CACHE_MAX = 50;
+const KB_BODY_CACHE_TTL_MS = 60 * 1000;
+const kbDocBodyCache = new Map();
+let kbDocBodyCacheBucket = null;
+
+async function kbGetDocTextCached(env, key) {
+  if (!env || !env.R2) return null;
+  const now = Date.now();
+  if (kbDocBodyCacheBucket !== env.R2) {
+    kbDocBodyCache.clear();
+    kbDocBodyCacheBucket = env.R2;
+  }
+  const hit = kbDocBodyCache.get(key);
+  if (hit && now < hit.exp) {
+    kbDocBodyCache.delete(key);
+    kbDocBodyCache.set(key, hit);
+    return hit.text;
+  }
+  const obj = await env.R2.get(key);
+  if (!obj) return null;
+  const text = await obj.text();
+  if (text.length <= 120000) {
+    if (kbDocBodyCache.size >= KB_BODY_CACHE_MAX) {
+      const oldest = kbDocBodyCache.keys().next().value;
+      if (oldest !== undefined) kbDocBodyCache.delete(oldest);
+    }
+    kbDocBodyCache.set(key, { text, exp: now + KB_BODY_CACHE_TTL_MS });
+  }
+  return text;
+}
+
+function kbInvalidateDocCache(key) {
+  if (key) kbDocBodyCache.delete(key);
+  else kbDocBodyCache.clear();
+}
+
 // 分词辅助：英文/数字按词、中文按单字 + 2-gram，用于正文多关键词相关性检索
 function docSearchTokens(s) {
   const out = [];
@@ -53,6 +91,7 @@ async function toolSaveDoc(env, chatId, args) {
   const body = head + content;
   // v6.8.3：校验写入结果，R2 写入失败（如权限问题）不再谎称成功
   const okDoc = await storePutChecked(env, key, body);
+  kbInvalidateDocCache(key);
   if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
   const entry = {
     file: file,
@@ -94,9 +133,8 @@ async function toolReadDoc(env, args) {
   const hit = kbFindRegEntry(reg, query);
   if (hit) {
     try {
-      const obj = await env.R2.get(KB_DOCS_PREFIX + hit.file);
-      if (!obj) return '文档读取失败：' + (hit.title || hit.file);
-      const fullText = await obj.text();
+      const fullText = await kbGetDocTextCached(env, KB_DOCS_PREFIX + hit.file);
+      if (fullText === null) return '文档读取失败：' + (hit.title || hit.file);
       const totalLen = fullText.length;
       if (offset >= totalLen) {
         return '【知识库文档《' + (hit.title || hit.file) + '》】偏移量 offset=' + offset + ' 已超出文档总长度（' + totalLen + ' 字符）。';
@@ -136,9 +174,8 @@ async function kbSearchDocBody(env, entries, query) {
       const k = typeof entry === 'string' ? entry : (KB_DOCS_PREFIX + entry.file);
       const docTitle = (entry && entry.title) ? entry.title : kbDocTitleOf(k);
       try {
-        const obj = await env.R2.get(k);
-        if (!obj) return null;
-        const text = await obj.text();
+        const text = await kbGetDocTextCached(env, k);
+        if (text === null) return null;
         const lower = text.toLowerCase();
 
         // 1) 优先检查完整 query 精确子串
@@ -222,7 +259,7 @@ async function toolDeleteDoc(env, args) {
     return '未找到标题包含"' + query + '"的文档。现有文档：\n' +
       reg.map(e => '- ' + (e.title || e.file)).join('\n');
   }
-  try { await env.R2.delete(KB_DOCS_PREFIX + hit.file); } catch (e) { return '删除失败：' + (hit.title || hit.file); }
+  try { await env.R2.delete(KB_DOCS_PREFIX + hit.file); kbInvalidateDocCache(KB_DOCS_PREFIX + hit.file); } catch (e) { return '删除失败：' + (hit.title || hit.file); }
   const okReg = await kbSaveRegistry(env, reg.filter(e => e !== hit));
   if (!okReg) return '文档文件已删除，但注册表更新失败，列表可能仍显示旧条目；下次读取会自动重建注册表。《' + (hit.title || hit.file) + '》';
   return '已删除知识库文档《' + (hit.title || hit.file) + '》';

@@ -232,7 +232,7 @@ export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
     agentToggle.classList.toggle('active', agentMode);
     agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
     agentToggle.title = agentMode
-      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
+      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
       : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';
   }
   if (agentToggle) {

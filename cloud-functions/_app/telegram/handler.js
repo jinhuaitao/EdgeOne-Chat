@@ -407,7 +407,7 @@ export async function handleTgWebhook(request, env) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 13 项工具（🔍 搜索、📄 网页、🌐 维基百科、💱 实时汇率/币价、🧮 科学计算、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 19 项工具（🔍 搜索、📄 网页、🌐 维基百科、💱 实时汇率/币价、🧮 科学计算、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard }
             });
@@ -433,7 +433,7 @@ export async function handleTgWebhook(request, env) {
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
                 + "任务太长被暂停时，发送「继续」可接着做\n\n"
                 + "✨ 支持直接发送图片（多模态识图）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
-                + "🛠️ Agent 工具箱：🔍 联网搜索、📄 结构化网页阅读、🌐 维基百科、💱 实时汇率/加密币价、🧮 科学计算器、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "🛠️ Agent 工具箱（19 项零密钥工具）：🔍 联网搜索、📄 结构化网页阅读（L1 分页缓存）、🌐 维基百科、🐙 GitHub 仓库检索、🎓 arXiv 论文检索、🔥 科技/开源实时热榜、💱 实时汇率/加密币价、🧮 科学/统计计算器、📏 单位与进制换算、🔤 文本/哈希/编码工具、🖧 IP/DNS 网络查询、🌤 3日天气预报、🕐 时间与日期推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库分页精读与全文检索。"
                 + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 全套零配置增强）"
             });
             return;
@@ -493,19 +493,21 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          let targetModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
-          if (!targetModelId) {
-            targetModelId = await storeGet(env, `tg_user_${chatId}`);
-            if (targetModelId) mapSetBounded(tgUserModels, chatId, targetModelId, undefined, tgUserModelsExp);
+          const cachedModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
+          const [loadedModelId, useAgent, baseHistory] = await Promise.all([
+            cachedModelId ? Promise.resolve(cachedModelId) : storeGet(env, `tg_user_${chatId}`),
+            agentGetMode(env, chatId),
+            tgGetHistory(env, chatId),
+          ]);
+          const targetModelId = loadedModelId || '';
+          if (!cachedModelId && targetModelId) {
+            mapSetBounded(tgUserModels, chatId, targetModelId, undefined, tgUserModelsExp);
           }
 
-          const useAgent = await agentGetMode(env, chatId);
           const wantResume = useAgent && !multimodalContent && userText.trim() === '继续';
           let resumeState = null;
           if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
           if (useAgent && !resumeState) await agentClearResumeState(env, chatId);
-
-          const baseHistory = await tgGetHistory(env, chatId);
           let history = baseHistory.slice();
           if (!resumeState) {
             history.push({ role: "user", content: multimodalContent || userText });

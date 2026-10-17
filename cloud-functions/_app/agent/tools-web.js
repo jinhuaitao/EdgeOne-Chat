@@ -1,6 +1,36 @@
-// Agent 工具：DuckDuckGo 搜索与网页结构化正文抓取（支持 offset 分页与 Jina 免密钥回退）
+// Agent 工具：DuckDuckGo 搜索、网页结构化正文抓取（含 L1 分页缓存与 Jina 回退）、GitHub 仓库检索、arXiv 论文检索、科技/开源实时热榜
 
 import { isBlockedFetchHost } from '../net/ssrf.js';
+
+// 网页正文 L1 缓存（URL -> { text, exp }），避免长网页用 offset 翻页时重复发起网络请求
+const PAGE_CACHE_MAX = 30;
+const PAGE_CACHE_TTL_MS = 5 * 60 * 1000;
+const parsedPageCache = new Map();
+
+function getCachedPageText(url) {
+  const hit = parsedPageCache.get(url);
+  if (!hit) return null;
+  if (Date.now() > hit.exp) {
+    parsedPageCache.delete(url);
+    return null;
+  }
+  parsedPageCache.delete(url);
+  parsedPageCache.set(url, hit);
+  return hit.text;
+}
+
+function setCachedPageText(url, text) {
+  if (!url || !text || text.length > 300000) return;
+  if (parsedPageCache.size >= PAGE_CACHE_MAX) {
+    const oldest = parsedPageCache.keys().next().value;
+    if (oldest !== undefined) parsedPageCache.delete(oldest);
+  }
+  parsedPageCache.set(url, { text, exp: Date.now() + PAGE_CACHE_TTL_MS });
+}
+
+function clearWebPageCache() {
+  parsedPageCache.clear();
+}
 
 // 还原 DuckDuckGo 的跳转链接：html 端把真实地址藏在 uddg 参数里
 function unwrapDdgHref(href) {
@@ -159,11 +189,31 @@ async function toolWebSearch(query, count) {
   } finally { clearTimeout(timer); }
 }
 
+function formatWebPageSlice(text, offset, pageSize) {
+  const totalLen = text.length;
+  if (offset >= totalLen) {
+    return '偏移量 offset=' + offset + ' 已超出页面正文总长度（' + totalLen + ' 字符）';
+  }
+  const slice = text.slice(offset, offset + pageSize);
+  const nextOffset = offset + slice.length;
+  if (nextOffset < totalLen) {
+    return slice + '\n\n> （当前显示第 ' + offset + ' ~ ' + nextOffset + ' 字符，网页正文共 ' + totalLen + ' 字符；如需继续阅读后续部分，请调用 web_fetch 并传 offset=' + nextOffset + '）';
+  }
+  return slice;
+}
+
 async function toolWebFetch(url, offset) {
   url = String(url || '').trim();
   if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
   offset = Math.max(0, parseInt(offset, 10) || 0);
   const PAGE_SIZE = 6000;
+
+  // 若 L1 页面缓存已命中（尤其是 offset > 0 连续翻页场景），零网络开销直接切片返回
+  const cachedText = getCachedPageText(url);
+  if (cachedText) {
+    return formatWebPageSlice(cachedText, offset, PAGE_SIZE);
+  }
+
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 16000);
   try {
@@ -213,16 +263,8 @@ async function toolWebFetch(url, offset) {
     }
 
     if (!text) return '页面无有效文本内容';
-    const totalLen = text.length;
-    if (offset >= totalLen) {
-      return '偏移量 offset=' + offset + ' 已超出页面正文总长度（' + totalLen + ' 字符）';
-    }
-    const slice = text.slice(offset, offset + PAGE_SIZE);
-    const nextOffset = offset + slice.length;
-    if (nextOffset < totalLen) {
-      return slice + '\n\n> （当前显示第 ' + offset + ' ~ ' + nextOffset + ' 字符，网页正文共 ' + totalLen + ' 字符；如需继续阅读后续部分，请调用 web_fetch 并传 offset=' + nextOffset + '）';
-    }
-    return slice;
+    setCachedPageText(url, text);
+    return formatWebPageSlice(text, offset, PAGE_SIZE);
   } catch (e) {
     return '抓取失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
   } finally { clearTimeout(timer); }
@@ -246,10 +288,217 @@ function parseDuckDuckGoLite(html, count) {
   return out;
 }
 
+// ==================== 新增工具 4：GitHub 开源仓库详情与搜索（toolGithubLookup） ====================
+async function toolGithubLookup(args) {
+  args = args || {};
+  let raw = String(args.query || args.repo || '').trim();
+  if (!raw) return 'GitHub 查询失败: 关键词或仓库名为空';
+  raw = raw.replace(/^https?:\/\/(?:www\.)?github\.com\//i, '').replace(/\/+$/, '');
+
+  const ghHeaders = {
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'EdgeOne-Chat/7.0'
+  };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+
+  try {
+    // 若形如 owner/repo（无空格），直接查询该仓库详情与最新 Release
+    const repoMatch = /^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)$/.exec(raw);
+    if (repoMatch) {
+      const slug = `${repoMatch[1]}/${repoMatch[2].replace(/\.git$/i, '')}`;
+      const [repoRes, relRes] = await Promise.all([
+        fetch(`https://api.github.com/repos/${slug}`, { headers: ghHeaders, signal: ctrl.signal }),
+        fetch(`https://api.github.com/repos/${slug}/releases/latest`, { headers: ghHeaders, signal: ctrl.signal }).catch(() => null),
+      ]);
+      if (!repoRes.ok) {
+        return `GitHub 查询失败: 仓库 ${slug} 请求返回 HTTP ${repoRes.status}`;
+      }
+      const repo = await repoRes.json();
+      let relLine = '无正式 Release';
+      if (relRes && relRes.ok) {
+        try {
+          const rel = await relRes.json();
+          if (rel && rel.tag_name) {
+            relLine = `${rel.tag_name}${rel.published_at ? '（发布于 ' + rel.published_at.slice(0, 10) + '）' : ''}`;
+          }
+        } catch (e) {}
+      }
+      const topics = Array.isArray(repo.topics) && repo.topics.length ? repo.topics.slice(0, 8).join(', ') : '无';
+      return `【GitHub 仓库：${repo.full_name}】\n`
+        + `- 链接：${repo.html_url}\n`
+        + `- 简介：${repo.description || '无描述'}\n`
+        + `- 数据：⭐ ${repo.stargazers_count} Stars | 🍴 ${repo.forks_count} Forks | 🐛 ${repo.open_issues_count} Open Issues\n`
+        + `- 语言与协议：${repo.language || '未知'} | License: ${(repo.license && (repo.license.spdx_id || repo.license.name)) || '未声明'}\n`
+        + `- 最新版本：${relLine}\n`
+        + `- 最近推送：${repo.pushed_at ? repo.pushed_at.slice(0, 10) : '未知'}\n`
+        + `- 标签 (Topics)：${topics}`;
+    }
+
+    // 否则按关键词检索热门仓库
+    const count = Math.min(Math.max(parseInt(args.count, 10) || 5, 1), 8);
+    const sort = args.sort === 'updated' ? 'updated' : 'stars';
+    const searchUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(raw)}&sort=${sort}&order=desc&per_page=${count}`;
+    const res = await fetch(searchUrl, { headers: ghHeaders, signal: ctrl.signal });
+    if (!res.ok) return `GitHub 查询失败: HTTP ${res.status}`;
+    const data = await res.json();
+    const items = (data && Array.isArray(data.items)) ? data.items : [];
+    if (!items.length) return `GitHub 未找到与「${raw}」相关的开源仓库`;
+
+    let out = `【GitHub 开源仓库检索：「${raw}」（共找到 ${data.total_count || items.length} 个，显示前 ${items.length} 个）】\n`;
+    items.forEach((it, idx) => {
+      out += `${idx + 1}. **${it.full_name}** (⭐ ${it.stargazers_count} | ${it.language || '未知语言'})\n`
+        + `   链接：${it.html_url}\n`
+        + `   简介：${(it.description || '无描述').slice(0, 180)}\n`;
+    });
+    return out.trim();
+  } catch (e) {
+    return 'GitHub 查询失败: ' + (e && e.name === 'AbortError' ? '超时' : e.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ==================== 新增工具 5：arXiv 学术论文检索（toolArxivSearch） ====================
+function decodeXmlEntities(s) {
+  return String(s || '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/\s+/g, ' ').trim();
+}
+
+async function toolArxivSearch(args) {
+  args = args || {};
+  const query = String(args.query || '').trim();
+  if (!query) return 'arXiv 检索失败: 查询关键词为空';
+  const count = Math.min(Math.max(parseInt(args.count, 10) || 4, 1), 6);
+  const sortBy = args.sort === 'date' ? 'submittedDate' : 'relevance';
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const apiUrl = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&start=0&max_results=${count}&sortBy=${sortBy}&sortOrder=descending`;
+    const res = await fetch(apiUrl, {
+      headers: { 'User-Agent': 'EdgeOne-Chat/7.0' },
+      signal: ctrl.signal
+    });
+    if (!res.ok) return `arXiv 检索失败: HTTP ${res.status}`;
+    const xml = await readBodyBudget(res, 250000);
+    const entries = [];
+    const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
+    let m;
+    while ((m = entryRe.exec(xml)) && entries.length < count) {
+      const block = m[1];
+      const titleM = /<title>([\s\S]*?)<\/title>/.exec(block);
+      const sumM = /<summary>([\s\S]*?)<\/summary>/.exec(block);
+      const idM = /<id>([\s\S]*?)<\/id>/.exec(block);
+      const pubM = /<published>([\s\S]*?)<\/published>/.exec(block);
+      const authors = [];
+      const authRe = /<author>[\s\S]*?<name>([\s\S]*?)<\/name>[\s\S]*?<\/author>/g;
+      let am;
+      while ((am = authRe.exec(block)) && authors.length < 5) {
+        authors.push(decodeXmlEntities(am[1]));
+      }
+      const rawId = idM ? decodeXmlEntities(idM[1]) : '';
+      const pdfUrl = rawId ? rawId.replace('/abs/', '/pdf/') : '';
+      entries.push({
+        title: titleM ? decodeXmlEntities(titleM[1]) : '无标题',
+        summary: sumM ? decodeXmlEntities(sumM[1]).slice(0, 450) : '',
+        url: rawId,
+        pdfUrl,
+        published: pubM ? decodeXmlEntities(pubM[1]).slice(0, 10) : '',
+        authors: authors.join(', ') + (authors.length >= 5 ? ' 等' : ''),
+      });
+    }
+    if (!entries.length) return `arXiv 未找到与「${query}」相关的论文`;
+    let out = `【arXiv 学术论文检索：「${query}」】\n`;
+    entries.forEach((e, i) => {
+      out += `${i + 1}. 《${e.title}》（${e.published || '未知日期'}）\n`
+        + `   作者：${e.authors || '未知'}\n`
+        + `   链接：${e.url}${e.pdfUrl ? ' | PDF: ' + e.pdfUrl : ''}\n`
+        + `   摘要：${e.summary}\n`;
+    });
+    return out.trim();
+  } catch (e) {
+    return 'arXiv 检索失败: ' + (e && e.name === 'AbortError' ? '超时' : e.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ==================== 新增工具 6：科技与开源实时热榜（toolTrendingNews） ====================
+async function toolTrendingNews(args) {
+  args = args || {};
+  const source = String(args.source || 'hn').trim().toLowerCase();
+  const count = Math.min(Math.max(parseInt(args.count, 10) || 5, 1), 8);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+
+  try {
+    if (source === 'github' || source === 'gh') {
+      const sinceDate = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+      const lang = String(args.language || '').trim();
+      const q = `created:>${sinceDate}` + (lang ? ` language:${lang}` : '');
+      const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${count}`;
+      const res = await fetch(url, {
+        headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'EdgeOne-Chat/7.0' },
+        signal: ctrl.signal
+      });
+      if (!res.ok) return `热榜获取失败: GitHub HTTP ${res.status}`;
+      const data = await res.json();
+      const items = (data && Array.isArray(data.items)) ? data.items : [];
+      if (!items.length) return '热榜获取失败: 暂无符合条件的 GitHub 热门新仓库';
+      let out = `【GitHub 近期飙升开源项目榜${lang ? ' (' + lang + ')' : ''}】\n`;
+      items.forEach((it, idx) => {
+        out += `${idx + 1}. **${it.full_name}** (⭐ ${it.stargazers_count} | ${it.language || '综合'})\n`
+          + `   ${it.html_url}\n`
+          + `   简介：${(it.description || '无描述').slice(0, 160)}\n`;
+      });
+      return out.trim();
+    }
+
+    // 默认 Hacker News Top Stories
+    const topRes = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json', {
+      headers: { 'User-Agent': 'EdgeOne-Chat/7.0' },
+      signal: ctrl.signal
+    });
+    if (!topRes.ok) return `热榜获取失败: Hacker News HTTP ${topRes.status}`;
+    const ids = await topRes.json();
+    if (!Array.isArray(ids) || !ids.length) return '热榜获取失败: Hacker News 列表为空';
+    const pickedIds = ids.slice(0, count);
+    const stories = await Promise.all(pickedIds.map(async (id) => {
+      try {
+        const r = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, {
+          headers: { 'User-Agent': 'EdgeOne-Chat/7.0' },
+          signal: ctrl.signal
+        });
+        if (!r.ok) return null;
+        return await r.json();
+      } catch (e) { return null; }
+    }));
+    const valid = stories.filter(s => s && s.title);
+    if (!valid.length) return '热榜获取失败: 未能读取 Hacker News 条目详情';
+    let out = `【Hacker News 实时科技热榜 Top ${valid.length}】\n`;
+    valid.forEach((s, idx) => {
+      const link = s.url || `https://news.ycombinator.com/item?id=${s.id}`;
+      out += `${idx + 1}. ${s.title}（🔥 ${s.score || 0} pts · 💬 ${s.descendants || 0} 评论）\n   ${link}\n`;
+    });
+    return out.trim();
+  } catch (e) {
+    return '热榜获取失败: ' + (e && e.name === 'AbortError' ? '超时' : e.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export {
   parseDuckDuckGo,
   parseDuckDuckGoLite,
   htmlToStructuredText,
   toolWebSearch,
   toolWebFetch,
+  toolGithubLookup,
+  toolArxivSearch,
+  toolTrendingNews,
+  clearWebPageCache,
 };

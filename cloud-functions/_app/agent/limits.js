@@ -23,6 +23,12 @@ function describeToolCall(name, args) {
     case 'wiki_lookup': return '🌐 正在查阅维基百科：' + (args.query || '');
     case 'exchange_rate': return '💱 正在查询汇率/行情：' + (args.from || '') + (args.to ? ' → ' + args.to : '');
     case 'calculate': return '🧮 正在计算：' + (args.expression || '');
+    case 'unit_convert': return '📏 正在换算单位/进制：' + (args.value !== undefined ? args.value + ' ' : '') + (args.from || args.base_from || '') + ' → ' + (args.to || args.base_to || '');
+    case 'text_toolkit': return '🔤 正在执行文本/编码工具：' + (args.action || 'stats');
+    case 'network_lookup': return '🖧 正在查询 IP/DNS 网络信息：' + (args.target || '');
+    case 'github_lookup': return '🐙 正在检索 GitHub 开源仓库：' + (args.query || args.repo || '');
+    case 'arxiv_search': return '🎓 正在检索 arXiv 学术论文：' + (args.query || '');
+    case 'trending_news': return '🔥 正在获取实时科技/开源热榜：' + (args.source || 'hn');
     case 'get_weather': return '🌤 正在查询天气：' + (args.city || '');
     case 'get_time': return '🕐 正在获取时间/推算日期…';
     case 'remember': return '🧠 正在记住…';

@@ -122,7 +122,7 @@ export default `</head>
               {{MODEL_OPTIONS}}
             </select>
           </div>
-          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人">🤖 Agent</button>
+          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人">🤖 Agent</button>
         </div>
       </div>
       <div class="disclaimer">AI 生成的内容可能不准确，请核实重要信息。</div>

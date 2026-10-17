@@ -61,8 +61,13 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   const msgLen = (m) => {
     try { return JSON.stringify(m).length; } catch (e) { return 0; }
   };
+  const lens = new Array(arr.length);
   let total = 0;
-  for (const m of arr) total += msgLen(m);
+  for (let i = 0; i < arr.length; i++) {
+    const l = msgLen(arr[i]);
+    lens[i] = l;
+    total += l;
+  }
   if (total <= budget) return arr.slice();
   // 找出本轮循环内的"轮次"边界：每轮以 role=assistant 开头
   const rounds = [];
@@ -74,7 +79,7 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   // 至少保留最后一轮（当前正在进行的上下文），从最旧的轮次开始删
   const doomed = new Set();
   for (let r = 0; r < rounds.length - 1 && total > budget; r++) {
-    for (const i of rounds[r]) { doomed.add(i); total -= msgLen(arr[i]); }
+    for (const i of rounds[r]) { doomed.add(i); total -= lens[i]; }
   }
   if (!doomed.size) return arr.slice();
   const out = [];

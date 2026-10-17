@@ -15,7 +15,7 @@ import { kbGetRegistry } from '../kb/registry.js';
 // "失败"二字（如新闻标题）被误判，导致正常结果也被当成空转。
 function isToolResultFailure(result) {
   const s = String(result == null ? '' : result);
-  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
+  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|单位换算失败|文本工具执行失败|网络查询失败|GitHub 查询失败|GitHub 未找到|arXiv 检索失败|arXiv 未找到|热榜获取失败|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
 }
 
 // 步数用尽后的无工具收尾：不再提供 tools，强制模型把已有结果收成最终答案。
@@ -71,11 +71,11 @@ function extractMsgPlainText(content) {
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
   const kbReadOnly = !!(opts && opts.kbReadOnly);
-  const memories = kbReadOnly ? [] : await agentGetMemories(env, chatId);
-  let kbDocs = null;
-  if (opts && opts.kbFirst) {
-    try { kbDocs = await kbGetRegistry(env); } catch (e) { kbDocs = null; }
-  }
+  const shouldLoadKb = !!(allowTools || (opts && opts.kbFirst));
+  const [memories, kbDocs] = await Promise.all([
+    kbReadOnly ? Promise.resolve([]) : agentGetMemories(env, chatId),
+    shouldLoadKb ? kbGetRegistry(env).catch(() => null) : Promise.resolve(null),
+  ]);
   const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
   const tools = allowTools ? getAgentTools(kbReadOnly) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
@@ -258,14 +258,33 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       } catch (e) {}
     }
 
-    const toolResults = await Promise.all(toolCalls.map(async (tc) => {
-      const fn = (tc && tc.function) || {};
-      let args = {};
-      try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
-      if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过', failed: true };
-      const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly);
-      return { tc, result: truncateToolResult(result, 4000), failed: isToolResultFailure(result) };
-    }));
+    // 并发度控制（上限 4）+ 同批次同参去重：避免单轮大量工具调用打满连接或重复执行
+    const MAX_CONCURRENT_TOOLS = 4;
+    const toolResults = new Array(toolCalls.length);
+    const stepDedup = new Map();
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(MAX_CONCURRENT_TOOLS, toolCalls.length) }, async () => {
+      while (cursor < toolCalls.length) {
+        const idx = cursor++;
+        const tc = toolCalls[idx];
+        const fn = (tc && tc.function) || {};
+        let args = {};
+        try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
+        if (!fn.name) {
+          toolResults[idx] = { tc, result: '工具调用缺少名称，已跳过', failed: true };
+          continue;
+        }
+        const sig = toolCallSignature(tc);
+        let p = stepDedup.get(sig);
+        if (!p) {
+          p = execAgentTool(fn.name, args, env, chatId, kbReadOnly);
+          stepDedup.set(sig, p);
+        }
+        const result = await p;
+        toolResults[idx] = { tc, result: truncateToolResult(result, 4000), failed: isToolResultFailure(result) };
+      }
+    });
+    await Promise.all(workers);
     let stepFailed = 0;
     for (const tr of toolResults) {
       const fn = (tr.tc && tr.tc.function) || {};
