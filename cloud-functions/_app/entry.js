@@ -6,7 +6,8 @@
 //   2) 客户端 IP：rate-limit.js 增加了 EO-Connecting-IP 等头名；
 //   3) 配置缓存：channel.js 的模型配置缓存加了 env 签名，避免多实例下串配置；
 //   4) /healthz 额外返回当前生效的存储后端，便于线上排障；
-//   5) 新增 /tg-setup 自诊断端点，把 Telegram 的静默失败翻成可读原因。
+//   5) 新增 /tg-setup 自诊断端点，把 Telegram 的静默失败翻成可读原因；
+//   6) 新增微信 ClawBot (iLink) 通道路由（/api/wx/* 与 /wx-webhook）。
 
 import { CORS_HEADERS, TEXT_HEADERS, HTML_HEADERS, SSE_HEADERS, PNG_HEADERS,
   MANIFEST_HEADERS, SW_HEADERS, HEALTH_HEADERS, APP_VERSION, imgHeaders } from './constants.js';
@@ -17,6 +18,7 @@ import { readErrorBody } from './agent/stability.js';
 import { handleWebAgent } from './web-agent.js';
 import { handleTgWebhook } from './telegram/handler.js';
 import { handleTgSetup } from './telegram/setup.js';
+import { handleWxWebhook, handleWxApi, maybeWakeWxDaemon } from './wechat/handler.js';
 import { ICON_B64, getIconBytes } from './pwa/icons.js';
 import { MANIFEST_JSON } from './pwa/manifest.js';
 import { SW_JS } from './pwa/service-worker.js';
@@ -80,8 +82,6 @@ async function routeRequest(request, env, ctx) {
     // 健康探针：供前端与 Service Worker 判断服务端是否可达。
     // ⚠️ SW 中必须显式放行该路径且绝不缓存，否则探针会被缓存应答 →
     //    永远「探测成功」→ 自动重连逻辑形同虚设。
-    // 额外返回 storage 字段：blob:xxx / kv(xxx) / memory，一眼看出持久化是否真的接上了。
-    // 设 STORAGE_DEBUG=1 时会附带后端探测详情（Blob 引入报错、发现的 KV 绑定名等），便于排障。
     if (request.method === 'GET' && url.pathname === '/healthz') {
       const payload = {
         ok: true,
@@ -92,22 +92,25 @@ async function routeRequest(request, env, ctx) {
       if (env && env.STORAGE_DEBUG === '1') {
         const debug = {};
         try { Object.assign(debug, storageDiagnostics(ctx && ctx.__context, env)); } catch (e) {}
-        // ?probe=1 会真实写入并读回一个临时对象，用来确认存储「真的能用」
-        // （getStore() 成功只代表 SDK 加载了，不代表有权限/有配额）
         if (url.searchParams.get('probe') === '1') {
           try { debug.probe = await probeStore(); } catch (e) {}
         }
-        // 密钥池状态：多 key 时哪个 key 正在冷却、上次失败是什么状态码。
-        // 只回显掩码（***abcd），绝不输出 key 原文。
         try { debug.keyPool = keyPoolStatus(env); } catch (e) {}
         payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
     }
 
+    // 微信 ClawBot (iLink) Web 管理与扫码绑定 / 长轮询触发接口（内部由 checkWxAdminAuth 强制防盗绑鉴权）
+    if (url.pathname !== '/wx-webhook') {
+      maybeWakeWxDaemon(request, env, ctx);
+    }
+
+    if (url.pathname.startsWith('/api/wx/')) {
+      return await handleWxApi(request, env, url, ctx);
+    }
+
     // 生图结果：转存后的图片通过这里回给浏览器。
-    // 公开访问（<img src> 没法带自定义头），所以靠随机且不可枚举的 id 做保护，
-    // 并严格校验 id 形态杜绝路径穿越。
     if (request.method === 'GET' && url.pathname.startsWith(IMG_URL_PATH)) {
       const id = url.pathname.slice(IMG_URL_PATH.length);
       const img = await loadStoredImage(env, id);
@@ -146,8 +149,6 @@ async function routeRequest(request, env, ctx) {
           return await handleWebAgent(env, body);
         }
 
-        // 多 key 场景：401/402/403/429 会自动换一个 key 重试（见 channel.js 密钥池）。
-        // 未配置密钥时不发送 Authorization 头（兼容 Ollama 之类免密钥网关）。
         const { resp: upstreamResponse } = await fetchWithKeyRotation(aiConfig, (key) => ({
           method: 'POST',
           headers: authHeaders(key),
@@ -155,7 +156,6 @@ async function routeRequest(request, env, ctx) {
         }));
 
         if (!upstreamResponse.ok) {
-          // 错误正文限长读取 —— 上游偶发返回超大 HTML 错误页时不再整段读入
           const errText = await readErrorBody(upstreamResponse, 2048);
           return new Response(JSON.stringify({ error: `API 报错 (${upstreamResponse.status}):${errText}` }), {
             status: upstreamResponse.status,
@@ -166,10 +166,6 @@ async function routeRequest(request, env, ctx) {
         if (!isImageAPI) {
           return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
         } else {
-          // 图像接口的响应体不是 chat 流，需要单独解析：
-          // 兼容 data[].url、data[].b64_json（SenseNova 默认返回方式）以及
-          // 少数把图片塞在 choices[].message.content 里的网关。
-          // 拿到的图片统一转存到自有存储，返回 /api/img/<id> 长期链接。
           return await buildImageSseResponse(env, upstreamResponse);
         }
       } catch (error) {
@@ -206,11 +202,13 @@ async function routeRequest(request, env, ctx) {
     }
 
     // Telegram 自诊断 / 一键绑定 webhook（需 TG_SETUP_KEY，回退 TG_WEBHOOK_SECRET）。
-    // 存在的理由：setWebhook 返回 ok 只代表「请求被接受」，不代表链路可用 ——
-    // 真正的失败信息藏在 getWebhookInfo().last_error_message 里。这个端点把它
-    // 连同本地配置快照与进程内事件一起摊开，省掉「盲猜 + 反复重部署」。
     if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/tg-setup') {
       return await handleTgSetup(request, env, url);
+    }
+
+    // 微信 ClawBot (iLink) Webhook：支持第三方 iLink 网关推送消息
+    if ((request.method === 'POST' || request.method === 'GET') && url.pathname === '/wx-webhook') {
+      return await handleWxWebhook(request, env, url, ctx);
     }
 
     return new Response('Not Found', { status: 404 });
@@ -220,7 +218,6 @@ async function routeRequest(request, env, ctx) {
 }
 
 // CORS 收紧（可选）。配置 CORS_ORIGIN 后，Access-Control-Allow-Origin 只回显名单内的 Origin。
-// 在顶层统一改写，覆盖包括 web-agent / auth 等所有子模块的响应。
 function applyCorsOrigin(res, env, request) {
   if (!env || !env.CORS_ORIGIN) return res;
   if (!res.headers.has('Access-Control-Allow-Origin')) return res;
@@ -243,7 +240,6 @@ async function handle(context) {
 
   let store = null;
   try {
-    // 传入 context 是为了让存储层能在 env / context / globalThis 三处自动发现 KV 绑定
     store = await resolveStore(context, rawEnv);
   } catch (e) {
     store = null;
@@ -257,12 +253,9 @@ async function handle(context) {
       } catch (e) {}
       return undefined;
     },
-    // EdgeOne 原始 context：仅供存储层自动发现 KV 绑定与 /healthz 排障输出使用
     __context: context,
   };
 
-  // 自动创建 Blob 命名空间：首个请求时异步跑一次「写标记 + 读回校验」，不阻塞本次响应。
-  // 放在这里（而不是模块顶层）是因为需要 waitUntil 托管，避免响应结束后写入被截断。
   try { ensureProvisioned(rawEnv, ctx, store); } catch (e) {}
 
   const res = await routeRequest(request, env, ctx);

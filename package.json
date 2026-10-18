@@ -1,9 +1,9 @@
 {
   "name": "edgeone-chat",
-  "version": "7.0.0",
+  "version": "7.4.0",
   "private": true,
   "type": "module",
-  "description": "EdgeOne-Chat：多通道 AI 对话前端，跑在腾讯云 EdgeOne Makers Cloud Functions (Node.js) 上，持久化用 Blob 存储",
+  "description": "EdgeOne-Chat：多通道 AI 对话前端 + Telegram & 微信 ClawBot (iLink) 机器人，跑在腾讯云 EdgeOne Makers Cloud Functions (Node.js) 上，持久化用 Blob 存储",
   "engines": {
     "node": ">=20.0.0"
   },

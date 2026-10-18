@@ -94,6 +94,7 @@ self.addEventListener('fetch', function (event) {
   // 实时接口：直连网络，不缓存
   if (url.pathname.indexOf('/api/') === 0) return;
   if (url.pathname === '/tg-webhook') return;
+  if (url.pathname === '/wx-webhook') return;
   // 自诊断端点同样直连网络：它返回的是实时配置与 Telegram 侧状态，缓存毫无意义
   if (url.pathname === '/tg-setup') return;
 

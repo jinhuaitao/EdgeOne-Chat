@@ -5,7 +5,7 @@
 由上游原版 v7.0.0（跑在 Cloudflare Workers + R2 上）完整移植而来。
 
 ✨ 多通道 AI 对话 · PWA · 语音朗读 · Agent 模式（19 个零密钥工具 · L1 缓存加速）·
-知识库 2.0（长期记忆 + 文档精读 + 全文检索）· Telegram 机器人
+知识库 2.0（长期记忆 + 文档精读 + 全文检索）· Telegram 机器人 · 🟢 微信 ClawBot (iLink) 官方通道（四重防盗绑锁）
 
 ---
 
@@ -90,6 +90,14 @@ https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的EdgeOne域
 
 机器人不响应时的排查顺序与完整能力表见[第三节](#三telegram-机器人)。
 
+### 7. 绑定微信 ClawBot 通道（可选，四重防盗绑保护）
+
+- **在环境变量中配置管理员密钥**：进入 EdgeOne 项目 **设置 → 环境变量**，添加 `WX_ADMIN_SECRET = <你的专属管理密码>`（或复用 `ACCESS_PASSWORD`）并重新部署。
+- **方式 A（在 Telegram 私聊中绑定，最安全省心）**：在受 `TG_ALLOWED_CHAT_IDS` 保护的 Telegram 私聊窗口向机器人发送 `/wxlogin`，点击返回的官方链接用手机微信扫码确认连接（支持 `/wxstatus` 查看状态、`/wxunbind` 解绑）。
+- **方式 B（在 Web 界面验证密钥后扫码）**：打开手机微信 **「我 → 设置 → 插件 → ClawBot」**，点击网页左下角侧边栏的 **🟢 微信图标** → 输入 `WX_ADMIN_SECRET` 点击 **「验证」** → 点击 **「📱 扫码绑定微信 ClawBot」** 扫码确认。
+- **后台长轮询触发**：可勾选网页弹窗中的「保持当前网页打开时实时加速轮询微信消息」，或用任意定时任务（如腾讯云 SCF 定时触发器 / UptimeRobot / cron-job.org）每分钟请求 `https://<你的EdgeOne域名>/api/wx/poll?key=<WX_ADMIN_SECRET>&timeout_ms=50000`。
+
+
 ---
 
 ## 二、环境变量一览
@@ -148,6 +156,18 @@ API_CONFIG = [{"url":"https://api.deepseek.com/v1/chat/completions",
 | `ACCESS_PASSWORD` ⭐ | 访问口令，不配则任何人可打开页面 |
 | `RATE_LIMIT_PER_MIN` | 每 IP 每分钟请求上限，默认 `60` |
 | `CORS_ORIGIN` | 允许跨域的来源，不配则不放行跨域 |
+
+### 🟢 微信 ClawBot (iLink) 通道
+
+| 变量 | 说明 |
+|---|---|
+| `WX_ADMIN_SECRET` ⭐ | **微信通道专属管理员密钥**：用于解锁网页端扫码绑定、解绑及 `/api/wx/poll?key=...` 轮询调用，与普通访客的 `ACCESS_PASSWORD` 权限隔离（未配时回退使用 `ACCESS_PASSWORD`；若两者均未配，则网页端禁止扫码绑定，彻底防路人盗绑） |
+| `WX_BOT_TOKEN` | 微信 iLink `bot_token`（Web 或 Telegram `/wxlogin` 扫码后会自动持久化到 Blob 存储；若在环境变量中手动填入则永久锁定，无法在网页解绑或覆盖） |
+| `WX_ALLOWED_USERS` | 允许对话的微信用户 `ilink_user_id` 白名单，英文逗号分隔（不填则自动锁定为扫码绑定人本人，外人无法触发对话） |
+| `WX_WEBHOOK_SECRET` | 当使用第三方 iLink 网关推送至 `/wx-webhook` 时的校验密钥 |
+| `WX_POLL_BUDGET_MS` | 单次 `/api/wx/poll` 长轮询最大运行毫秒数，默认 `25000`（EdgeOne 函数支持最高 120s，可设为 `55000`~`85000`） |
+| `WX_WEBHOOK_BUDGET_MS` | 微信单轮 Agent 运行预算，默认 `55000`（超时自动存档至 Blob，微信发「继续」即可续做） |
+| `WX_CHANNEL_VERSION` | 模拟 `@tencent-weixin/openclaw-weixin` 协议版本号，默认 `2.4.10`（自动编码 `iLink-App-ClientVersion: 132106`） |
 
 ### 💬 Telegram 机器人
 

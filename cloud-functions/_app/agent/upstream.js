@@ -102,8 +102,8 @@ async function readUpstreamMessage(resp, onDelta) {
   if (!sawSSE) {
     try {
       const j = JSON.parse(raw);
-      if (j && j.data && j.data[0] && j.data[0].url) {
-        return { imageUrl: j.data[0].url, content: '', reasoning: '', toolCalls: [], forwarded: false };
+      if (j && j.data && j.data[0] && (j.data[0].url || j.data[0].b64_json)) {
+        return { imageUrl: j.data[0].url || ('data:image/png;base64,' + j.data[0].b64_json), content: '', reasoning: '', toolCalls: [], forwarded: false };
       }
       const ch = j && j.choices && j.choices[0];
       const m = ch && (ch.message || ch.delta);

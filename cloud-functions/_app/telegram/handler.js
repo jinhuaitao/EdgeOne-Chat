@@ -1,4 +1,5 @@
 // Telegram Webhook：命令、模型选择、文件/图片多模态处理、Agent 对话与回复发送
+// v7.4.0 增强：新增私聊专属微信 ClawBot 安全绑定命令（/wxlogin、/wxstatus、/wxunbind）
 
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
@@ -12,6 +13,23 @@ import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs } from '../kb/doc-tools.js';
 import { tgNote } from './diag.js';
+import {
+  DEFAULT_ILINK_BASE_URL,
+  DEFAULT_ILINK_CDN_URL,
+  DEFAULT_ILINK_CHANNEL_VERSION,
+  normalizeBaseUrl,
+  ilinkGetQrCode,
+  ilinkGetQrStatus,
+  ilinkNotifyStart,
+  ilinkNotifyStop,
+} from '../wechat/ilink.js';
+import {
+  getWxCredentials,
+  saveWxCredentials,
+  clearWxCredentials,
+  saveWxCursor,
+  kickWxAutoDaemon,
+} from '../wechat/handler.js';
 
 // 全局内存缓存（L1 缓存，带 60s TTL）
 const tgUserModels = new Map();
@@ -45,9 +63,10 @@ async function markUpdateSeen(env, uid) {
   if (fresh.length > TG_DEDUP_MAX) fresh.splice(0, fresh.length - TG_DEDUP_MAX);
   try { await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh)); } catch (e) {}
   seenUpdateIds.set(uid, now);
-  for (const [k, t] of seenUpdateIds) { if (now - t > TG_DEDUP_WINDOW_MS) seenUpdateIds.delete(k); }
+  for (const [k, t] of seenUpdateIds) { if (now - t > WX_DEDUP_SAFE_MS) seenUpdateIds.delete(k); }
   return false;
 }
+const WX_DEDUP_SAFE_MS = TG_DEDUP_WINDOW_MS;
 async function releaseUpdateForRetry(env, uid) {
   if (uid === undefined || uid === null) return;
   seenUpdateIds.delete(uid);
@@ -67,7 +86,10 @@ function parseCommand(t) {
 
 // 群组 @ 提及与引用回复识别缓存（key: bot token -> lowercase username）
 const botUsernameCache = new Map();
-const KNOWN_TG_COMMANDS = new Set(['/start', '/model', '/clear', '/new', '/help', '/memory', '/kb', '/forget', '/agent']);
+const KNOWN_TG_COMMANDS = new Set([
+  '/start', '/model', '/clear', '/new', '/help', '/memory', '/kb', '/forget', '/agent',
+  '/wxlogin', '/wxstatus', '/wxunbind'
+]);
 
 function extractBotIdFromToken(token) {
   const t = String(token || '').trim();
@@ -224,8 +246,6 @@ export async function handleTgWebhook(request, env) {
   if (env.TG_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
     if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
-      // 这是「setWebhook 报成功、机器人却不理人」的第二大根因：
-      // 改了 TG_WEBHOOK_SECRET 却没重新 setWebhook，Telegram 发的还是旧 secret。
       tgNote('forbidden', {
         reason: 'secret_mismatch',
         detail: '收到 secret 长度 ' + got.length + '（空=' + (got === '') + '），期望长度 ' + String(env.TG_WEBHOOK_SECRET).length,
@@ -258,8 +278,6 @@ export async function handleTgWebhook(request, env) {
       try {
         const { models: modelObjList } = getChannelConfig(env);
         if (modelObjList.length === 0) {
-          // 静默失败的头号源头：没有解析出模型 → 直接 return → 机器人完全不说话，
-          // 而 Telegram 侧收到的是 200 OK，从任何地方都看不出异常。
           tgNote('skip', { reason: 'no_models', updateId: update.update_id, detail: 'getChannelConfig 解析出 0 个模型' });
           return;
         }
@@ -314,8 +332,6 @@ export async function handleTgWebhook(request, env) {
         }
         const chatId = msg.chat.id;
         if (!isChatAllowed(chatId)) {
-          // 把真实 chat_id 原样记下来：这是「机器人没反应」最高频的根因，
-          // 用户只要把它复制进 TG_ALLOWED_CHAT_IDS 就能修好，不用去别处找。
           tgNote('skip', {
             reason: 'chat_not_allowed',
             updateId: update.update_id,
@@ -326,7 +342,6 @@ export async function handleTgWebhook(request, env) {
           return;
         }
 
-        // 群组场景（group / supergroup）：默认仅在 @机器人、回复机器人消息或发送命令时触发
         const groupCheck = await evaluateGroupTrigger(msg, env, tgApi);
         if (groupCheck.isGroup && !groupCheck.triggered) {
           tgNote('skip', {
@@ -342,7 +357,6 @@ export async function handleTgWebhook(request, env) {
           ? { reply_to_message_id: msg.message_id, allow_sending_without_reply: true }
           : {};
 
-        // 提取消息内容：支持纯文本、文本文档直传（.md/.txt/.csv/.json/代码）、图片（Vision 多模态）
         let userText = typeof msg.text === 'string' ? groupCheck.cleanText(msg.text) : '';
         if (groupCheck.isGroup && typeof msg.text === 'string' && msg.text.trim() && !userText) {
           userText = '你好';
@@ -377,7 +391,6 @@ export async function handleTgWebhook(request, env) {
           }
         } else if (!userText && Array.isArray(msg.photo) && msg.photo.length > 0) {
           try {
-            // 选取不超过 1MB 的最高清图片尺寸
             const candidates = msg.photo.filter(p => !p.file_size || p.file_size <= 1024 * 1024);
             const picked = candidates.length ? candidates[candidates.length - 1] : msg.photo[msg.photo.length - 1];
             const bytes = await tgFetchFileBytes(env, picked.file_id, 2 * 1024 * 1024, tgApiTimeoutMs);
@@ -400,6 +413,125 @@ export async function handleTgWebhook(request, env) {
           if (cmd) {
             tgNote('ok', { reason: 'command', updateId: update.update_id, chatId: chatId, cmd: cmd.cmd });
           }
+
+          // ===== 新增：Telegram 私聊安全管理微信 ClawBot（/wxstatus, /wxlogin, /wxunbind） =====
+          if (cmd && (cmd.cmd === '/wxstatus' || cmd.cmd === '/wxlogin' || cmd.cmd === '/wxunbind')) {
+            if (groupCheck.isGroup) {
+              await tgApi('sendMessage', Object.assign({
+                chat_id: chatId,
+                text: '🔒 为保护你的微信账号隐私，请在与我的【私聊】窗口中使用微信 ClawBot 绑定命令。'
+              }, replyMsgParams));
+              return;
+            }
+            const chanVer = String((env && env.WX_CHANNEL_VERSION) || DEFAULT_ILINK_CHANNEL_VERSION).trim();
+            const defaultBase = normalizeBaseUrl((env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL);
+
+            if (cmd.cmd === '/wxstatus') {
+              const creds = await getWxCredentials(env, true);
+              if (creds && creds.bot_token && !creds.expired) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `🟢 微信 ClawBot 状态：已连接（已加锁保护）\n`
+                    + `• 机器人 ID：${creds.ilink_bot_id || '-'}\n`
+                    + `• 唯一绑定微信用户：${creds.ilink_user_id || '-'}\n`
+                    + `• 来源：${creds.source === 'env' ? '环境变量 WX_BOT_TOKEN' : 'Blob/KV 扫码持久化'}\n`
+                    + `• 如需解绑重绑，请发 /wxunbind`
+                });
+              } else if (creds && creds.expired) {
+                await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 微信 ClawBot 会话已过期 (ret=-14)，请发送 /wxlogin 重新扫码绑定。' });
+              } else {
+                await tgApi('sendMessage', { chat_id: chatId, text: '⚪ 微信 ClawBot 尚未绑定。发送 /wxlogin 即可在私聊中获取专属绑定二维码。' });
+              }
+              return;
+            }
+
+            if (cmd.cmd === '/wxunbind') {
+              const creds = await getWxCredentials(env, true);
+              if (creds && creds.source === 'env') {
+                await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 当前通过环境变量 WX_BOT_TOKEN 固定绑定，请在控制台移除该变量。' });
+                return;
+              }
+              if (creds && creds.bot_token) {
+                await ilinkNotifyStop(creds.baseurl, creds.bot_token, chanVer, 5000);
+              }
+              await clearWxCredentials(env);
+              await tgApi('sendMessage', { chat_id: chatId, text: '✅ 已解绑并清除微信 ClawBot 登录凭证。如需重新绑定请发 /wxlogin。' });
+              return;
+            }
+
+            if (cmd.cmd === '/wxlogin') {
+              const existing = await getWxCredentials(env, true);
+              if (existing && existing.bot_token && !existing.expired) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `🔒 当前已绑定微信账号（${existing.ilink_user_id || existing.ilink_bot_id}）。为防误覆盖，请先发送 /wxunbind 解绑后再执行 /wxlogin。`
+                });
+                return;
+              }
+              try {
+                const qrData = await ilinkGetQrCode(defaultBase, chanVer, 12000);
+                if (!qrData || !qrData.qrcode) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 获取微信二维码失败，请稍后重试。' });
+                  return;
+                }
+                const qrUrl = qrData.qrcode_img_content || '';
+                const statusMsgRes = await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `📱 请在 45 秒内打开下方官方链接并用手机微信扫码确认连接：\n${qrUrl}\n\n⏳ 正在等待你扫码确认…`
+                });
+                let statusMsgId = null;
+                if (statusMsgRes && statusMsgRes.ok) {
+                  try { const d = await statusMsgRes.json(); statusMsgId = d && d.result && d.result.message_id; } catch (e) {}
+                }
+                const deadline = Date.now() + 50000;
+                let pollBase = defaultBase;
+                while (Date.now() < deadline) {
+                  await new Promise(r => setTimeout(r, 2000));
+                  const st = await ilinkGetQrStatus(pollBase, qrData.qrcode, chanVer, 6000);
+                  if (st && st.redirect_baseurl) {
+                    pollBase = st.redirect_baseurl;
+                  }
+                  if (st && st.status === 'confirmed' && st.bot_token) {
+                    const newCreds = {
+                      bot_token: st.bot_token,
+                      ilink_bot_id: st.ilink_bot_id || 'wx_bot',
+                      ilink_user_id: st.ilink_user_id || '',
+                      baseurl: normalizeBaseUrl(st.redirect_baseurl || st.baseurl || pollBase || defaultBase),
+                      cdn_url: String((env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
+                      expired: false,
+                      errmsg: '',
+                      updated_at: new Date().toISOString(),
+                    };
+                    await saveWxCredentials(env, newCreds);
+                    newCreds.relay_origin = new URL(request.url).origin;
+                    await saveWxCredentials(env, newCreds);
+                    await saveWxCursor(env, newCreds.ilink_bot_id, '');
+                    await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
+                    kickWxAutoDaemon(env, null, newCreds.relay_origin);
+                    const okText = `🎉 微信 ClawBot 绑定成功并已自动加锁！\n• 机器人 ID：${newCreds.ilink_bot_id}\n• 唯一授权微信用户：${newCreds.ilink_user_id}\n现在可以直接在手机微信 ClawBot 中与我对话了。`;
+                    if (statusMsgId) {
+                      await tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: okText }).catch(() => {});
+                    } else {
+                      await tgApi('sendMessage', { chat_id: chatId, text: okText });
+                    }
+                    return;
+                  } else if (st && st.status === 'expired') {
+                    break;
+                  }
+                }
+                const timeoutText = '⌛ 扫码等待窗口已结束。如尚未完成确认，请重新发送 /wxlogin 获取新二维码。';
+                if (statusMsgId) {
+                  await tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: timeoutText }).catch(() => {});
+                } else {
+                  await tgApi('sendMessage', { chat_id: chatId, text: timeoutText });
+                }
+              } catch (e) {
+                await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 微信扫码绑定异常：' + (e && e.message ? e.message : String(e)) });
+              }
+              return;
+            }
+          }
+
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
               return [{ text: model.name, callback_data: `M:${index}` }];
@@ -431,6 +563,7 @@ export async function handleTgWebhook(request, env) {
                 + "/memory —— 查看长期记忆\n"
                 + "/forget 关键词 —— 删除包含关键词的记忆\n"
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
+                + "/wxlogin、/wxstatus、/wxunbind ——（私聊专属）安全扫码绑定/查看/解绑微信 ClawBot\n"
                 + "任务太长被暂停时，发送「继续」可接着做\n\n"
                 + "✨ 支持直接发送图片（多模态识图）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
                 + "🛠️ Agent 工具箱（19 项零密钥工具）：🔍 联网搜索、📄 结构化网页阅读（L1 分页缓存）、🌐 维基百科、🐙 GitHub 仓库检索、🎓 arXiv 论文检索、🔥 科技/开源实时热榜、💱 实时汇率/加密币价、🧮 科学/统计计算器、📏 单位与进制换算、🔤 文本/哈希/编码工具、🖧 IP/DNS 网络查询、🌤 3日天气预报、🕐 时间与日期推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库分页精读与全文检索。"
@@ -541,7 +674,6 @@ export async function handleTgWebhook(request, env) {
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
           const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText };
 
-          // 图片消息优先走无工具单轮多模态调用（部分上游模型不支持 tools + image_url 混用），若开启 Agent 且非图片则走 ReAct 循环
           if (useAgent && !multimodalContent) {
             let lastProgressEdit = 0;
             const onProgress = async (text, force) => {
@@ -589,7 +721,6 @@ export async function handleTgWebhook(request, env) {
               }
             }
           } else {
-            // 普通模式或多模态图片识图问答
             const aiConfig = buildAIRequest(env, targetModelId, history, false);
             if (aiConfig.error) {
               if (pendingMsgId) {
@@ -602,7 +733,6 @@ export async function handleTgWebhook(request, env) {
             let aiResponse = null;
             for (let tgAttempt = 1; tgAttempt <= 2; tgAttempt++) {
               try {
-                // 密钥池轮换：多 key 时撞上失效/被限流的 key 会自动换一个重试
                 const r = await fetchWithKeyRotation(aiConfig, (key) => ({
                   method: 'POST',
                   headers: authHeaders(key),
