@@ -72,7 +72,7 @@ function buildIlinkHeaders(token, channelVersion, isJsonPost = true) {
   return headers;
 }
 
-// 通用 iLink POST JSON 调用封装
+// 通用 iLink POST JSON 调用封装（内置针对 ilinkai.weixin.qq.com 偶发节点抖动的快速重试）
 async function ilinkPost(baseUrl, endpoint, bodyObj, token, channelVersion, timeoutMs) {
   const base = normalizeBaseUrl(baseUrl);
   const ep = String(endpoint || '').replace(/^\/+/, '');
@@ -80,13 +80,25 @@ async function ilinkPost(baseUrl, endpoint, bodyObj, token, channelVersion, time
     base_info: buildBaseInfo(channelVersion),
   });
   const raw = JSON.stringify(payload);
-  const headers = buildIlinkHeaders(token, channelVersion, true);
-  const res = await fetch(`${base}/${ep}`, {
-    method: 'POST',
-    headers,
-    body: raw,
-    signal: AbortSignal.timeout(timeoutMs || 15000),
-  });
+  const budgetMs = timeoutMs || 15000;
+  let res = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const startAt = Date.now();
+    try {
+      res = await fetch(`${base}/${ep}`, {
+        method: 'POST',
+        headers: buildIlinkHeaders(token, channelVersion, true),
+        body: raw,
+        signal: AbortSignal.timeout(budgetMs),
+      });
+      break;
+    } catch (err) {
+      const elapsed = Date.now() - startAt;
+      // 若在建连/TLS 阶段快速失败（< 3.5s，如命中不稳定 IP 节点），立即换新 UIN 重试一次；若已是长轮询等待超时则直接抛出由上层按超时处理
+      if (attempt >= 2 || elapsed >= 3500 || budgetMs < 5000) throw err;
+      await new Promise(r => { const t = setTimeout(r, 350); if (t && typeof t.unref === 'function') t.unref(); });
+    }
+  }
   if (!res.ok) {
     let errBody = '';
     try { errBody = (await res.text()).slice(0, 400); } catch (e) {}
@@ -170,14 +182,16 @@ async function ilinkNotifyStop(baseUrl, token, channelVersion, timeoutMs) {
 }
 
 // 4. 长轮询获取新消息（getupdates）
-// 注意：腾讯 iLink 服务端对 getupdates 固定 Hold 35 秒（longpolling_timeout_ms: 35000），
-// 客户端超时必须 >= 38~40 秒（严禁设为 16s/22s/25s），否则客户端提前 Abort 会在腾讯服务端留下
-// 35 秒未释放的“僵尸连接”，导致期间发来的微信消息掉进僵尸连接并苦等约 65 秒才重投！
-const ILINK_SERVER_HOLD_MS = 35000;
-const ILINK_DEFAULT_POLL_TIMEOUT_MS = 40000;
+// 关键工程约束：
+// Serverless 平台（Cloudflare Workers waitUntil / EdgeOne 网关 / Node undici 默认 headersTimeout）
+// 对无响应头的后台连接有严格的 30 秒硬限制（超时会抛 UND_ERR_HEADERS_TIMEOUT 或直接强杀实例导致断链，
+// 进而使微信顶部出现“暂时无法连接 OpenClaw”）。
+// 因此单次长轮询窗口默认设为 18 秒（允许范围 8s~24s），确保在 30 秒大限前 100% 干净返回并交棒下一跳！
+const ILINK_DEFAULT_POLL_TIMEOUT_MS = 18000;
 
 async function ilinkGetUpdates(baseUrl, token, getUpdatesBuf, channelVersion, timeoutMs) {
-  const effectiveTimeout = Math.max(parseInt(timeoutMs, 10) || ILINK_DEFAULT_POLL_TIMEOUT_MS, 38000);
+  const effectiveTimeout = Math.min(Math.max(parseInt(timeoutMs, 10) || ILINK_DEFAULT_POLL_TIMEOUT_MS, 5000), 25000);
+  const startAt = Date.now();
   try {
     const data = await ilinkPost(
       baseUrl,
@@ -187,20 +201,25 @@ async function ilinkGetUpdates(baseUrl, token, getUpdatesBuf, channelVersion, ti
       channelVersion,
       effectiveTimeout
     );
-    return data || { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf || '', longpolling_timeout_ms: ILINK_SERVER_HOLD_MS };
+    return data || { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf || '' };
   } catch (e) {
+    const elapsed = Date.now() - startAt;
     const nm = (e && e.name) ? String(e.name) : '';
     const msg = String((e && e.message) || '');
+    const cause = (e && e.cause) || {};
+    const causeStr = `${cause.name || ''} ${cause.code || ''} ${cause.message || ''}`;
     const st = (e && typeof e.status === 'number') ? e.status : 0;
-    // 客户端超时或上游网关长轮询空转超时（502/503/504/524）均视为正常空轮询控制流，保留原游标继续下一轮
+    // 客户端主动超时、undici HeadersTimeoutError (Issue #67564)、长等待后的连接重置或网关 502/503/504/524
+    // 一律视为正常的长轮询空包边界，保留原游标平滑进入下一棒，绝不中断轮询链！
     if (
       nm === 'AbortError'
       || nm === 'TimeoutError'
-      || /abort|timeout/i.test(msg)
+      || /abort|timeout|UND_ERR_HEADERS_TIMEOUT|UND_ERR_SOCKET|ECONNRESET|socket hang up/i.test(msg + ' ' + causeStr)
+      || (elapsed >= effectiveTimeout - 1500)
       || st === 502 || st === 503 || st === 504 || st === 524
     ) {
       if (st >= 500) {
-        await new Promise(r => { const t = setTimeout(r, 1200); if (t && typeof t.unref === 'function') t.unref(); });
+        await new Promise(r => { const t = setTimeout(r, 800); if (t && typeof t.unref === 'function') t.unref(); });
       }
       return { ret: 0, msgs: [], get_updates_buf: String(getUpdatesBuf || ''), timedOut: true };
     }

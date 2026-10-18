@@ -1406,17 +1406,25 @@ async function processWechatMessage(env, creds, rawMsg) {
   }
 }
 
-// ================= 7. 长轮询引擎（对齐腾讯 iLink 35s 服务端 Hold + 流式交棒自接力） =================
-// 核心机制说明：
-// 1) 腾讯 iLink `POST /ilink/bot/getupdates` 在无新消息时固定 Hold 35 秒（longpolling_timeout_ms: 35000）。
-//    客户端超时必须设为 >= 38~40 秒，严禁设为 16s/22s 或发起剩余时间 < 38s 的残缺轮询，
-//    否则客户端提前 Abort 会在腾讯服务端留下 35s 僵尸连接，导致期间用户发来的消息掉进僵尸连接而苦等约 65 秒！
-// 2) 轮询锁租约设为 45 秒（覆盖完整 35s Hold + 5s 余量），且仅包裹 `getupdates + 游标保存` 阶段；
-//    一旦收到消息或完成一轮 35s 空轮询，立即释放轮询锁并并发启动下一棒自接力（triggerNextSelfRelay），
-//    让下一棒在 100~300ms 内通过 HTTP 流式握手无缝接管监听，当前实例同时执行 AI 推理与回复，并在退出前确保交棒完成！
-const WX_LOCK_DEFAULT_TTL_MS = 45000;
-const WX_MIN_FULL_POLL_MS = 38000;
-const WX_DEFAULT_LONGPOLL_MS = 40000;
+// ================= 7. 长轮询引擎（18s 黄金窗口防 30s 强杀 + 周期性 notifyStart 在线保活 + 独立进程处理消息） =================
+// 核心工程设计（彻底解决“65 秒延迟”与“一会就显示暂时无法连接 OpenClaw”）：
+// 1) 为什么之前会出现“一会就暂时无法连接 OpenClaw”？
+//    因为 Serverless 平台（Cloudflare waitUntil / EdgeOne / Node undici 默认 headersTimeout）对后台任务和无响应头请求
+//    有严格的【30 秒】硬性超时限制（详见 openclaw Issue #67564）。若单次轮询设为 35s~40s 或总周期设为 48s~65s，
+//    运行到第 30 秒时实例就会被平台强行杀死，导致永远走不到末尾的 `triggerNextSelfRelay` 交棒，接力链当场断裂！
+//    一旦停止轮询满 30~60 秒，腾讯 iLink 服务端就会判定机器人离线，在手机微信顶部弹出“暂时无法连接 OpenClaw”。
+// 2) 18 秒黄金接力窗口（WX_DEFAULT_LONGPOLL_MS = 18000，锁租约 22000）：
+//    每棒固定只跑 1 轮 18 秒长轮询，在第 18 秒（距离 30 秒强杀线还有整整 12 秒充裕时间！）干净结束，
+//    立即释放轮询锁并握手唤醒下一棒 `/wx-webhook?relay=1`；
+// 3) 周期性 `ilinkNotifyStart` 在线心跳保活：
+//    每 3 棒（约 50 秒）自动向腾讯 iLink 服务端发送一次非阻塞 `notifystart` 心跳，持续刷新在线状态；
+// 4) 收消息与 AI 推理彻底解耦（支持独立 `/wx-webhook?process=1` 满血生命周期）：
+//    一旦收到微信消息，0ms 释放轮询锁并唤醒下一棒继续监听新消息；若当前实例已运行超过 6 秒，
+//    自动将消息投递给全新的 `/wx-webhook?process=1` 实例（拥有从 0 秒起算的完整生命周期）执行 AI 推理与回复！
+const WX_LOCK_DEFAULT_TTL_MS = 22000;
+const WX_MIN_FULL_POLL_MS = 8000;
+const WX_DEFAULT_LONGPOLL_MS = 18000;
+let lastNotifyStartAt = 0;
 
 async function isPollLockHeld(env) {
   if (activePollInIsolate) return true;
@@ -1426,7 +1434,7 @@ async function isPollLockHeld(env) {
     const raw = await storeGet(env, WX_POLL_LOCK_KEY);
     if (raw) {
       const lock = JSON.parse(raw);
-      if (lock && lock.exp > now && lock.exp - now <= 52000) {
+      if (lock && lock.exp > now && lock.exp - now <= 26000) {
         return true;
       }
     }
@@ -1446,13 +1454,13 @@ async function acquirePollLock(env, ttlMs, force) {
       const raw = await storeGet(env, WX_POLL_LOCK_KEY);
       if (raw) {
         const lock = JSON.parse(raw);
-        if (lock && lock.exp > now && lock.exp - now <= 52000) {
+        if (lock && lock.exp > now && lock.exp - now <= 26000) {
           return false;
         }
       }
     }
     activePollInIsolate = true;
-    const leaseMs = Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 15000), 50000);
+    const leaseMs = Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 10000), 25000);
     await storePut(env, WX_POLL_LOCK_KEY, JSON.stringify({ exp: now + leaseMs, ts: now }));
   } catch (e) {
     activePollInIsolate = true;
@@ -1464,7 +1472,7 @@ async function renewPollLock(env, ttlMs) {
   if (!env || !env.R2) return;
   try {
     const now = Date.now();
-    const leaseMs = Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 15000), 50000);
+    const leaseMs = Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 10000), 25000);
     await storePut(env, WX_POLL_LOCK_KEY, JSON.stringify({ exp: now + leaseMs, ts: now }));
   } catch (e) {}
 }
@@ -1476,8 +1484,73 @@ async function releasePollLock(env) {
   }
 }
 
+// 定期向腾讯 iLink 发送 notifystart 在线心跳（每 45 秒最多一次，非阻塞），防止微信顶部弹出“暂时无法连接 OpenClaw”
+function maybeSendPeriodicNotifyStart(creds, chanVer, ctx) {
+  try {
+    const now = Date.now();
+    if (now - lastNotifyStartAt < 45000) return;
+    lastNotifyStartAt = now;
+    const p = ilinkNotifyStart(creds.baseurl, creds.bot_token, chanVer, 5000).catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      try { ctx.waitUntil(p); } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+// 若当前轮询实例已消耗较多时间，优先将入站消息交由全新的 `/wx-webhook?process=1` HTTP 请求实例处理（满血 60~120s 预算），失败则原地处理
+async function dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, elapsedMs, ctx) {
+  let processedCount = 0;
+  if (!pendingMsgs || !pendingMsgs.length) return 0;
+
+  if (elapsedMs >= 6000 && isRealPublicOrigin(effOrigin)) {
+    try {
+      const relayToken = computeWxRelayToken(creds.bot_token);
+      const procUrl = `${effOrigin}/wx-webhook?process=1`;
+      const procFetch = fetch(procUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wx-Relay-Token': relayToken,
+        },
+        body: JSON.stringify({ action: 'process', msgs: pendingMsgs }),
+        signal: AbortSignal.timeout(55000),
+      });
+
+      const earlyRes = await Promise.race([
+        procFetch,
+        new Promise(r => { const t = setTimeout(() => r('IN_FLIGHT'), 1200); if (t && typeof t.unref === 'function') t.unref(); }),
+      ]);
+
+      if (earlyRes === 'IN_FLIGHT') {
+        const bgProc = procFetch.then(r => (r ? r.text().catch(() => '') : '')).catch(() => '');
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          try { ctx.waitUntil(bgProc); } catch (e) {}
+        }
+        return pendingMsgs.length;
+      }
+      if (earlyRes && earlyRes.ok) {
+        const data = await earlyRes.json().catch(() => ({}));
+        return typeof data.processed === 'number' ? data.processed : pendingMsgs.length;
+      }
+    } catch (e) {
+      // 回退到当前实例直接处理
+    }
+  }
+
+  for (const m of pendingMsgs) {
+    try {
+      const r = await processWechatMessage(env, creds, m);
+      if (r && r.processed) processedCount += 1;
+    } catch (err) {
+      console.log('处理微信 ClawBot 消息异常:', err);
+    }
+  }
+  return processedCount;
+}
+
 async function runWechatPollCycle(env, opts) {
   opts = opts || {};
+  const cycleStartAt = Date.now();
   const creds = await getWxCredentials(env);
   if (!creds || !creds.bot_token) {
     return { ok: false, reason: 'not_configured', message: '尚未绑定微信 ClawBot，请先扫码绑定或配置 WX_BOT_TOKEN' };
@@ -1486,11 +1559,11 @@ async function runWechatPollCycle(env, opts) {
     return { ok: false, reason: 'session_expired', expired: true, message: creds.errmsg || '微信 ClawBot 会话已过期 (ret=-14)，请重新扫码绑定' };
   }
 
-  let longPollTimeoutMs = Math.min(Math.max(parseInt(opts.longPollTimeoutMs || env.WX_LONGPOLL_TIMEOUT_MS || String(WX_DEFAULT_LONGPOLL_MS), 10) || WX_DEFAULT_LONGPOLL_MS, WX_MIN_FULL_POLL_MS), 45000);
-  const maxRuntimeMs = Math.min(Math.max(parseInt(opts.maxRuntimeMs || env.WX_POLL_BUDGET_MS || String(longPollTimeoutMs + 4000), 10) || (longPollTimeoutMs + 4000), longPollTimeoutMs + 2000), 95000);
-  const maxRounds = Math.min(Math.max(parseInt(opts.maxRounds || '2', 10) || 2, 1), 4);
+  const longPollTimeoutMs = Math.min(Math.max(parseInt(opts.longPollTimeoutMs || env.WX_LONGPOLL_TIMEOUT_MS || String(WX_DEFAULT_LONGPOLL_MS), 10) || WX_DEFAULT_LONGPOLL_MS, WX_MIN_FULL_POLL_MS), 22000);
+  const maxRuntimeMs = Math.min(Math.max(parseInt(opts.maxRuntimeMs || env.WX_POLL_BUDGET_MS || String(longPollTimeoutMs + 3000), 10) || (longPollTimeoutMs + 3000), longPollTimeoutMs + 1500), 26000);
+  const maxRounds = Math.min(Math.max(parseInt(opts.maxRounds || '1', 10) || 1, 1), 2);
 
-  if (!(await acquirePollLock(env, longPollTimeoutMs + 5000, !!opts.force))) {
+  if (!(await acquirePollLock(env, longPollTimeoutMs + 4000, !!opts.force))) {
     const diagNow = await getWxDiagSummary(env);
     return {
       ok: true,
@@ -1504,12 +1577,14 @@ async function runWechatPollCycle(env, opts) {
     };
   }
 
+  const chanVer = wxChannelVersion(env);
+  maybeSendPeriodicNotifyStart(creds, chanVer, opts.ctx);
   await wxRecordDiag(env, 'poll', '', creds.ilink_user_id, false);
+
   const deadline = Date.now() + maxRuntimeMs;
   let totalReceived = 0;
   let totalProcessed = 0;
   let cursor = await getWxCursor(env, creds.ilink_bot_id);
-  const chanVer = wxChannelVersion(env);
   let lockReleased = false;
   let relayTaskPromise = null;
   const effOrigin = isRealPublicOrigin(opts.origin)
@@ -1523,7 +1598,6 @@ async function runWechatPollCycle(env, opts) {
       await releasePollLock(env);
     }
     if (shouldRelay && opts.autoRelay && !relayTaskPromise) {
-      // 立即启动下一棒唤醒（与当前实例后续的 AI 推理并行执行，0ms 阻塞；在函数退出前再 await 确保握手必定完成）
       relayTaskPromise = triggerNextSelfRelay(env, effOrigin, currentHop, opts.ctx).catch(() => {});
       if (opts.ctx && typeof opts.ctx.waitUntil === 'function') {
         try { opts.ctx.waitUntil(relayTaskPromise); } catch (e) {}
@@ -1536,7 +1610,6 @@ async function runWechatPollCycle(env, opts) {
 
     for (let round = 0; round < maxRounds; round++) {
       const remainMs = deadline - Date.now();
-      // 严禁在剩余时间不足 38 秒时发起新一轮 getupdates（防止客户端提前 Abort 在腾讯服务端留下 35s 僵尸连接）
       if (round > 0 && remainMs < WX_MIN_FULL_POLL_MS) break;
 
       const pollTimeout = round === 0
@@ -1544,7 +1617,7 @@ async function runWechatPollCycle(env, opts) {
         : Math.min(longPollTimeoutMs, Math.max(WX_MIN_FULL_POLL_MS, remainMs - 500));
 
       if (round > 0) {
-        await renewPollLock(env, pollTimeout + 5000);
+        await renewPollLock(env, pollTimeout + 4000);
       }
 
       const resp = await ilinkGetUpdates(creds.baseurl, creds.bot_token, cursor, chanVer, pollTimeout);
@@ -1561,10 +1634,6 @@ async function runWechatPollCycle(env, opts) {
         };
       }
 
-      if (resp && typeof resp.longpolling_timeout_ms === 'number' && resp.longpolling_timeout_ms >= 20000) {
-        longPollTimeoutMs = Math.min(Math.max(resp.longpolling_timeout_ms + 5000, WX_MIN_FULL_POLL_MS), 45000);
-      }
-
       if (resp && typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
         cursor = resp.get_updates_buf;
         await saveWxCursor(env, creds.ilink_bot_id, cursor);
@@ -1574,7 +1643,6 @@ async function runWechatPollCycle(env, opts) {
       totalReceived += msgs.length;
 
       if (msgs.length > 0) {
-        // 预先提取并保存最新 context_token，确保下一棒或并发回复总能拿到最新上下文令牌
         for (const rawM of msgs) {
           try {
             const p = extractWechatMessageContent(rawM);
@@ -1584,28 +1652,20 @@ async function runWechatPollCycle(env, opts) {
           } catch (e) {}
         }
         pendingMsgs.push(...msgs);
-        // 一旦拿到新消息且新游标已落盘，立即跳出轮询循环！
-        // 先释放轮询锁并并发唤醒下一棒接力继续监听 getupdates，再在当前实例执行 AI 推理与回复！
         break;
       }
 
       if (opts.singleShot) break;
     }
 
-    // 轮询阶段完成：立即释放锁并并发启动下一棒接力握手，实现“收发零空窗期”
+    // 18s 轮询阶段完成：立即释放锁并并发启动下一棒接力握手（此时距 30s 强杀线还有 12s 余量，100% 稳定交棒）
     await startUnlockAndRelay(true);
 
-    // 紧接着在当前实例生命周期内完成所有入站消息的 AI 推理与微信回复投递（与下一棒握手完全并行，0ms 额外延迟）
-    for (const m of pendingMsgs) {
-      try {
-        const r = await processWechatMessage(env, creds, m);
-        if (r && r.processed) totalProcessed += 1;
-      } catch (err) {
-        console.log('处理微信 ClawBot 消息异常:', err);
-      }
+    if (pendingMsgs.length > 0) {
+      const elapsedMs = Date.now() - cycleStartAt;
+      totalProcessed += await dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, elapsedMs, opts.ctx);
     }
 
-    // 在当前请求退出前，确保下一棒自接力的 HTTP 握手已经确认完成（流式响应头仅需 ~100ms 即可返回）
     if (relayTaskPromise) {
       await relayTaskPromise;
     }
@@ -1621,7 +1681,7 @@ async function runWechatPollCycle(env, opts) {
       totalProcessed: wxDiagMem.totalProcessed,
     };
   } catch (e) {
-    await new Promise(r => { const t = setTimeout(r, 1500); if (t && typeof t.unref === 'function') t.unref(); });
+    await new Promise(r => { const t = setTimeout(r, 800); if (t && typeof t.unref === 'function') t.unref(); });
     await startUnlockAndRelay(true);
     if (relayTaskPromise) {
       await relayTaskPromise;
@@ -1640,7 +1700,7 @@ async function runWechatPollCycle(env, opts) {
   }
 }
 
-// 服务端全自动自接力常驻引擎（流式握手确认 + 容器内常驻自适应兜底）
+// 服务端全自动自接力常驻引擎（18s 周期流式握手 + 容器内自适应循环兜底）
 async function triggerNextSelfRelay(env, origin, hop, ctx) {
   try {
     const creds = await getWxCredentials(env);
@@ -1650,9 +1710,6 @@ async function triggerNextSelfRelay(env, origin, hop, ctx) {
 
     let httpRelayDispatched = false;
 
-    // 1) 优先通过公网自接力请求唤醒下一个完整的 Serverless 请求生命周期实例
-    //    下游 /wx-webhook?relay=1 采用流式响应，收到请求后立即返回 HTTP 200 响应头与首包心跳，
-    //    因此 await fetch(relayUrl) 在 ~100-300ms 内即可确认下游实例已成功启动！随后将流读取交由 waitUntil 后台保持连接。
     if (isRealPublicOrigin(effOrigin)) {
       const relayToken = computeWxRelayToken(creds.bot_token);
       const relayUrl = `${effOrigin}/wx-webhook?relay=1&hop=${nextHop}`;
@@ -1664,12 +1721,12 @@ async function triggerNextSelfRelay(env, origin, hop, ctx) {
             'X-Wx-Relay-Token': relayToken,
           },
           body: JSON.stringify({ action: 'poll', relay: true, hop: nextHop }),
-          signal: AbortSignal.timeout(55000),
+          signal: AbortSignal.timeout(28000),
         });
 
         const res = await Promise.race([
           fetchTask,
-          new Promise(r => { const t = setTimeout(() => r(null), 1500); if (t && typeof t.unref === 'function') t.unref(); }),
+          new Promise(r => { const t = setTimeout(() => r(null), 1200); if (t && typeof t.unref === 'function') t.unref(); }),
         ]);
 
         if (res && res.ok) {
@@ -1679,7 +1736,6 @@ async function triggerNextSelfRelay(env, origin, hop, ctx) {
             try { ctx.waitUntil(drainStream); } catch (e) {}
           }
         } else if (res === null) {
-          // fetch 仍在建立连接或下游未启用流式首包（如测试桩），继续将其放入 waitUntil 托管
           httpRelayDispatched = true;
           const bgFetch = fetchTask.then(r => (r ? r.text().catch(() => '') : '')).catch(() => '');
           if (ctx && typeof ctx.waitUntil === 'function') {
@@ -1691,15 +1747,14 @@ async function triggerNextSelfRelay(env, origin, hop, ctx) {
       }
     }
 
-    // 2) 仅当公网自调用因同域限制明确失败或未配置公网域名（!httpRelayDispatched）时，启用容器内常驻兜底续跑
     if (!httpRelayDispatched) {
       const fallbackTask = new Promise(resolve => {
-        const t = setTimeout(resolve, 300);
+        const t = setTimeout(resolve, 250);
         if (t && typeof t.unref === 'function') t.unref();
       }).then(async () => {
         if (await isPollLockHeld(env)) return;
         await runWechatPollCycle(env, {
-          maxRuntimeMs: 44000,
+          maxRuntimeMs: 22000,
           longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
           maxRounds: 1,
           singleShot: true,
@@ -1722,7 +1777,7 @@ function kickWxAutoDaemon(env, ctx, origin) {
   const task = (async () => {
     if (await isPollLockHeld(env)) return;
     await runWechatPollCycle(env, {
-      maxRuntimeMs: 44000,
+      maxRuntimeMs: 22000,
       longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
       maxRounds: 1,
       singleShot: true,
@@ -1742,8 +1797,8 @@ function maybeWakeWxDaemon(request, env, ctx) {
   try {
     const now = Date.now();
     if (activePollInIsolate) return;
-    if (wxDiagMem.lastPollAt && now - wxDiagMem.lastPollAt < 38000) return;
-    if (now - lastDaemonWakeCheckAt < 12000) return;
+    if (wxDiagMem.lastPollAt && now - wxDiagMem.lastPollAt < 18000) return;
+    if (now - lastDaemonWakeCheckAt < 8000) return;
     lastDaemonWakeCheckAt = now;
     const origin = request && request.url ? rememberPublicOrigin(request.url) : lastKnownPublicOrigin;
     if (!isRealPublicOrigin(origin)) return;
@@ -1782,12 +1837,12 @@ async function handleWxWebhook(request, env, url, ctx) {
   }
 
   if (request.method === 'GET') {
-    const timeoutMs = parseInt(reqUrl.searchParams.get('timeout_ms') || '44000', 10) || 44000;
+    const timeoutMs = parseInt(reqUrl.searchParams.get('timeout_ms') || '20000', 10) || 20000;
     const res = await runWechatPollCycle(env, {
-      maxRuntimeMs: Math.min(Math.max(timeoutMs, 42000), 85000),
+      maxRuntimeMs: Math.min(Math.max(timeoutMs, 15000), 25000),
       longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
-      maxRounds: 2,
-      singleShot: false,
+      maxRounds: 1,
+      singleShot: true,
       autoRelay: true,
       origin,
       relayHop: 1,
@@ -1804,9 +1859,6 @@ async function handleWxWebhook(request, env, url, ctx) {
       const isRelay = !!(payload && payload.relay) || reqUrl.searchParams.get('relay') === '1';
       const hop = parseInt((payload && payload.hop) || reqUrl.searchParams.get('hop') || '1', 10) || 1;
       if (isRelay) {
-        // 关键设计：采用 HTTP 流式响应（TransformStream）+ 10s 空白符保活心跳！
-        // 1) 立即刷新 HTTP 200 响应头与 JSON 前缀，使上游棒在 ~100ms 内即可确认本棒已成功接管；
-        // 2) 在本棒完整跑完 35s 长轮询 + 交棒下一跳期间保持 HTTP 响应流开启，彻底规避 Serverless 平台对已关闭响应的 30s waitUntil 强杀限制！
         if (typeof TransformStream === 'function') {
           const { readable, writable } = new TransformStream();
           const writer = writable.getWriter();
@@ -1817,11 +1869,11 @@ async function handleWxWebhook(request, env, url, ctx) {
               await writer.write(enc.encode(`{"ok":true,"relayed":true,"hop":${hop},"result":`));
               hbTimer = setInterval(() => {
                 writer.write(enc.encode(' ')).catch(() => {});
-              }, 10000);
+              }, 6000);
               if (hbTimer && typeof hbTimer.unref === 'function') hbTimer.unref();
 
               const r = await runWechatPollCycle(env, {
-                maxRuntimeMs: 44000,
+                maxRuntimeMs: 22000,
                 longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
                 maxRounds: 1,
                 singleShot: true,
@@ -1853,7 +1905,7 @@ async function handleWxWebhook(request, env, url, ctx) {
         }
 
         const relayCycleTask = runWechatPollCycle(env, {
-          maxRuntimeMs: 44000,
+          maxRuntimeMs: 22000,
           longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
           maxRounds: 1,
           singleShot: true,
@@ -1868,12 +1920,12 @@ async function handleWxWebhook(request, env, url, ctx) {
         const r = await relayCycleTask;
         return new Response(JSON.stringify({ ok: true, relayed: true, hop, result: r }), { status: 200, headers: CORS_HEADERS });
       }
-      const timeoutMs = parseInt(payload.timeout_ms || reqUrl.searchParams.get('timeout_ms') || '44000', 10) || 44000;
+      const timeoutMs = parseInt(payload.timeout_ms || reqUrl.searchParams.get('timeout_ms') || '20000', 10) || 20000;
       const res = await runWechatPollCycle(env, {
-        maxRuntimeMs: Math.min(Math.max(timeoutMs, 42000), 85000),
+        maxRuntimeMs: Math.min(Math.max(timeoutMs, 15000), 25000),
         longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
-        maxRounds: 2,
-        singleShot: false,
+        maxRounds: 1,
+        singleShot: true,
         autoRelay: true,
         origin,
         relayHop: 1,
@@ -2150,17 +2202,17 @@ async function handleWxApi(request, env, url, ctx) {
     if (request.method === 'POST') {
       try { body = await request.json(); } catch (e) { body = {}; }
     }
-    const reqTimeoutMs = parseInt(body.timeout_ms || url.searchParams.get('timeout_ms') || '40000', 10) || 40000;
+    const reqTimeoutMs = parseInt(body.timeout_ms || url.searchParams.get('timeout_ms') || '18000', 10) || 18000;
     const singleShot = body.single_shot !== undefined
       ? !!body.single_shot
       : (url.searchParams.get('single_shot') !== '0');
     const force = !!(body.force || url.searchParams.get('force') === '1');
-    const effectivePollMs = Math.min(Math.max(reqTimeoutMs, WX_MIN_FULL_POLL_MS), 45000);
+    const effectivePollMs = Math.min(Math.max(reqTimeoutMs, WX_MIN_FULL_POLL_MS), 22000);
     const result = await runWechatPollCycle(env, {
-      maxRuntimeMs: Math.min(Math.max(effectivePollMs + 4000, 42000), 85000),
+      maxRuntimeMs: Math.min(Math.max(effectivePollMs + 3000, 15000), 25000),
       longPollTimeoutMs: effectivePollMs,
-      maxRounds: singleShot ? 1 : 2,
-      singleShot,
+      maxRounds: 1,
+      singleShot: true,
       force,
       autoRelay: true,
       origin,
