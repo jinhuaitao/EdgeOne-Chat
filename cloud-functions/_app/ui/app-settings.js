@@ -436,7 +436,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       const res = await fetch('/api/wx/poll', {
         method: 'POST',
         headers: buildWxAuthHeaders(),
-        body: JSON.stringify({ timeout_ms: 15000, single_shot: true, force: false })
+        body: JSON.stringify({ timeout_ms: 12000, single_shot: true, force: false })
       });
       const data = await res.json();
       if (data && data.ok) {
@@ -508,7 +508,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
         const res = await fetch('/api/wx/poll', {
           method: 'POST',
           headers: buildWxAuthHeaders(),
-          body: JSON.stringify({ timeout_ms: 18000, single_shot: true })
+          body: JSON.stringify({ timeout_ms: 12000, single_shot: true })
         });
         const data = await res.json();
         if (res.status === 401 || res.status === 403 || (data && (data.expired || data.reason === 'not_configured'))) {

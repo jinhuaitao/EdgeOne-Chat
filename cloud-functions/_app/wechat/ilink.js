@@ -187,10 +187,10 @@ async function ilinkNotifyStop(baseUrl, token, channelVersion, timeoutMs) {
 // 对无响应头的后台连接有严格的 30 秒硬限制（超时会抛 UND_ERR_HEADERS_TIMEOUT 或直接强杀实例导致断链，
 // 进而使微信顶部出现“暂时无法连接 OpenClaw”）。
 // 因此单次长轮询窗口默认设为 18 秒（允许范围 8s~24s），确保在 30 秒大限前 100% 干净返回并交棒下一跳！
-const ILINK_DEFAULT_POLL_TIMEOUT_MS = 18000;
+const ILINK_DEFAULT_POLL_TIMEOUT_MS = 12000;
 
 async function ilinkGetUpdates(baseUrl, token, getUpdatesBuf, channelVersion, timeoutMs) {
-  const effectiveTimeout = Math.min(Math.max(parseInt(timeoutMs, 10) || ILINK_DEFAULT_POLL_TIMEOUT_MS, 5000), 25000);
+  const effectiveTimeout = Math.min(Math.max(parseInt(timeoutMs, 10) || ILINK_DEFAULT_POLL_TIMEOUT_MS, 3000), 24000);
   const startAt = Date.now();
   try {
     const data = await ilinkPost(

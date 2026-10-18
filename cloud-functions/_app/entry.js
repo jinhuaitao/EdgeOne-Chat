@@ -82,6 +82,11 @@ async function routeRequest(request, env, ctx) {
     // 健康探针：供前端与 Service Worker 判断服务端是否可达。
     // ⚠️ SW 中必须显式放行该路径且绝不缓存，否则探针会被缓存应答 →
     //    永远「探测成功」→ 自动重连逻辑形同虚设。
+    // 任何非 /wx-webhook 请求（包括前端 /healthz 探针、首页访问或外部无鉴权监控 ping /healthz）均自动检测并唤醒微信后台保活链
+    if (url.pathname !== '/wx-webhook') {
+      maybeWakeWxDaemon(request, env, ctx);
+    }
+
     if (request.method === 'GET' && url.pathname === '/healthz') {
       const payload = {
         ok: true,
@@ -99,11 +104,6 @@ async function routeRequest(request, env, ctx) {
         payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
-    }
-
-    // 微信 ClawBot (iLink) Web 管理与扫码绑定 / 长轮询触发接口（内部由 checkWxAdminAuth 强制防盗绑鉴权）
-    if (url.pathname !== '/wx-webhook') {
-      maybeWakeWxDaemon(request, env, ctx);
     }
 
     if (url.pathname.startsWith('/api/wx/')) {
