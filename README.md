@@ -95,7 +95,7 @@ https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的EdgeOne域
 - **在环境变量中配置管理员密钥**：进入 EdgeOne 项目 **设置 → 环境变量**，添加 `WX_ADMIN_SECRET = <你的专属管理密码>`（或复用 `ACCESS_PASSWORD`）并重新部署。
 - **方式 A（在 Telegram 私聊中绑定，最安全省心）**：在受 `TG_ALLOWED_CHAT_IDS` 保护的 Telegram 私聊窗口向机器人发送 `/wxlogin`，点击返回的官方链接用手机微信扫码确认连接（支持 `/wxstatus` 查看状态、`/wxunbind` 解绑）。
 - **方式 B（在 Web 界面验证密钥后扫码）**：打开手机微信 **「我 → 设置 → 插件 → ClawBot」**，点击网页左下角侧边栏的 **🟢 微信图标** → 输入 `WX_ADMIN_SECRET` 点击 **「验证」** → 点击 **「📱 扫码绑定微信 ClawBot」** 扫码确认。
-- **后台长轮询触发**：可勾选网页弹窗中的「保持当前网页打开时实时加速轮询微信消息」，或用任意定时任务（如腾讯云 SCF 定时触发器 / UptimeRobot / cron-job.org）每分钟请求 `https://<你的EdgeOne域名>/api/wx/poll?key=<WX_ADMIN_SECRET>&timeout_ms=50000`。
+- **后台长轮询触发**：可勾选网页弹窗中的「保持当前网页打开时实时加速轮询微信消息」，或用任意定时任务（如腾讯云 SCF 定时触发器 / UptimeRobot / cron-job.org）每分钟请求 `https://<你的EdgeOne域名>/healthz。
 
 
 ---
