@@ -1,0 +1,151 @@
+{{define "layout.html"}}<!DOCTYPE html>
+<html lang="zh-CN" data-theme="{{.Theme}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="csrf-token" content="{{.CSRF}}">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{.Title}} · DDNS Master</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v={{.AssetVersion}}">
+  <script src="/static/app.js?v={{.AssetVersion}}" defer></script>
+</head>
+<body class="app-body{{if .Running}} is-syncing{{end}}" data-sync-running="{{if .Running}}true{{else}}false{{end}}">
+  {{template "icons.html" .}}
+
+  <div class="app-shell">
+    <div class="nav-scrim" data-close-nav></div>
+    <aside class="sidebar" id="app-sidebar" aria-label="主导航">
+      <div class="sidebar-head">
+        <a class="brand" href="/">
+          <span class="brand-mark">{{icon "cloud"}}</span>
+          <span class="brand-copy">
+            <strong>DDNS Master</strong>
+            <small>Cloudflare DNS</small>
+          </span>
+        </a>
+        <button class="icon-btn sidebar-close" type="button" data-close-nav aria-label="关闭导航">{{icon "x"}}</button>
+      </div>
+
+      <nav class="sidebar-nav">
+        <p class="nav-label">工作台</p>
+        <a class="nav-link{{if eq .Page "dashboard"}} is-active{{end}}" href="/" {{if eq .Page "dashboard"}}aria-current="page"{{end}}>
+          <span class="nav-icon">{{icon "dashboard"}}</span><span>概览</span>
+        </a>
+        <a class="nav-link{{if eq .Page "history"}} is-active{{end}}" href="/history" {{if eq .Page "history"}}aria-current="page"{{end}}>
+          <span class="nav-icon">{{icon "history"}}</span><span>变更历史</span>
+        </a>
+        <a class="nav-link{{if eq .Page "logs"}} is-active{{end}}" href="/logs" {{if eq .Page "logs"}}aria-current="page"{{end}}>
+          <span class="nav-icon">{{icon "logs"}}</span><span>运行日志</span>
+        </a>
+
+        <p class="nav-label">系统</p>
+        <a class="nav-link{{if eq .Page "settings"}} is-active{{end}}" href="/settings" {{if eq .Page "settings"}}aria-current="page"{{end}}>
+          <span class="nav-icon">{{icon "settings"}}</span><span>系统设置</span>
+        </a>
+        <a class="nav-link{{if eq .Page "account"}} is-active{{end}}" href="/account" {{if eq .Page "account"}}aria-current="page"{{end}}>
+          <span class="nav-icon">{{icon "shield"}}</span><span>账号安全</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="sync-glance{{if .Running}} is-running{{end}}">
+          <div class="sync-glance-head">
+            <span class="status-dot{{if .HasToken}} is-live{{end}}"></span>
+            <span>{{if .Running}}正在同步{{else if .HasToken}}自动同步{{else}}同步已暂停{{end}}</span>
+            <span class="sync-glance-interval">{{.IntervalMinutes}} 分钟</span>
+          </div>
+          {{if .Running}}
+          <p class="sync-glance-meta">正在检查域名解析状态…</p>
+          {{else if .HasToken}}
+          <p class="sync-glance-meta">下次同步 <span data-countdown-target="{{countdown .NextSync}}">{{clock .NextSync}}</span></p>
+          {{else}}
+          <p class="sync-glance-meta"><a href="/settings">连接 Cloudflare 后自动运行</a></p>
+          {{end}}
+        </div>
+
+        <div class="sidebar-user">
+          <a class="user-chip" href="/account" title="账号设置">
+            <span class="avatar avatar-sm">{{initial .Username}}</span>
+            <span class="user-chip-copy"><strong>{{.Username}}</strong><small>管理员</small></span>
+          </a>
+          <form method="post" action="/logout" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+            <button class="icon-btn" type="submit" title="退出登录" aria-label="退出登录">{{icon "logout"}}</button>
+          </form>
+        </div>
+      </div>
+    </aside>
+
+    <div class="app-main">
+      <header class="topbar">
+        <button class="icon-btn nav-toggle" type="button" data-open-nav aria-label="打开导航">{{icon "menu"}}</button>
+        <div class="page-heading">
+          <p class="eyebrow">{{dateOnly .Now}} · 节点在线</p>
+          <h1>{{.Title}}</h1>
+          <p class="page-subtitle">{{.Subtitle}}</p>
+        </div>
+        <div class="topbar-actions">
+          <form method="post" action="/sync" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+            <button class="btn btn-ghost sync-button" type="submit" {{if or .Running (not .HasToken)}}disabled{{end}} title="{{if not .HasToken}}请先配置 Cloudflare Token{{else}}立即同步{{end}}">
+              {{if .Running}}{{icon "spinner" "spin"}}{{else}}{{icon "refresh"}}{{end}}
+              <span>{{if .Running}}同步中{{else}}立即同步{{end}}</span>
+            </button>
+          </form>
+          <button class="icon-btn theme-toggle" type="button" data-theme-toggle data-mode="{{.Theme}}" aria-label="切换主题" title="切换主题：{{if eq .Theme "auto"}}跟随系统{{else if eq .Theme "light"}}浅色{{else}}深色{{end}}">
+            <span class="theme-glyph when-auto">{{icon "monitor"}}</span>
+            <span class="theme-glyph when-light">{{icon "sun"}}</span>
+            <span class="theme-glyph when-dark">{{icon "moon"}}</span>
+          </button>
+          <a class="avatar topbar-avatar" href="/account" aria-label="账号设置" title="{{.Username}}">{{initial .Username}}</a>
+        </div>
+      </header>
+
+      <main class="page-content">
+        {{template "content" .}}
+      </main>
+
+      <footer class="app-footer">
+        <span>DDNS Master <span class="footer-version">{{.Version}}</span></span>
+        <span class="footer-sep">·</span>
+        <span>自托管 Cloudflare DDNS</span>
+        <span class="footer-spacer"></span>
+        <span>运行 {{uptime}}</span>
+      </footer>
+    </div>
+  </div>
+
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false">
+    {{range .Flashes}}
+    <div class="toast toast-{{.Type}}" role="status">
+      <span class="toast-icon">
+        {{if eq .Type "success"}}{{icon "check-circle"}}{{else if eq .Type "error"}}{{icon "alert-circle"}}{{else if eq .Type "warning"}}{{icon "alert"}}{{else}}{{icon "info"}}{{end}}
+      </span>
+      <span class="toast-message">{{.Message}}</span>
+      <button class="toast-close" type="button" data-toast-close aria-label="关闭提示">{{icon "x"}}</button>
+    </div>
+    {{end}}
+  </div>
+
+  <dialog class="modal" id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="post" action="/" class="modal-card modal-card-sm" id="confirm-form">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <div class="modal-head">
+        <span class="modal-badge is-danger" data-confirm-icon>{{icon "alert"}}</span>
+        <div class="modal-head-copy">
+          <h2 id="confirm-title" data-confirm-title>确认操作</h2>
+          <p>请确认是否继续</p>
+        </div>
+        <button class="icon-btn modal-close" type="button" data-close-dialog aria-label="关闭">{{icon "x"}}</button>
+      </div>
+      <p class="confirm-message" data-confirm-message>此操作无法撤销。</p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" type="button" data-close-dialog>取消</button>
+        <button class="btn btn-danger" type="submit" data-confirm-submit>确认</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>{{end}}

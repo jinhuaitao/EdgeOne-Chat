@@ -1,0 +1,99 @@
+{{define "content"}}
+<section class="profile-card">
+  <span class="profile-avatar">{{initial .User.Username}}</span>
+  <div class="profile-copy">
+    <span class="live-pill is-live"><span class="live-dot"></span>管理员账号</span>
+    <h2>{{.User.Username}}</h2>
+    <p>账号创建于 {{dateTime .User.CreatedAt}}{{if not .User.LastLoginAt.IsZero}} · 上次登录 {{relTime .User.LastLoginAt}}{{end}}</p>
+  </div>
+  <div class="profile-stats">
+    <div><span>用户 ID</span><strong>#{{.User.ID}}</strong></div>
+    <div><span>登录状态</span><strong>已验证</strong></div>
+    <div><span>账号角色</span><strong>Owner</strong></div>
+  </div>
+</section>
+
+<div class="account-grid">
+  <section class="card settings-card">
+    <div class="card-head">
+      <div class="card-title">
+        <div class="title-with-icon"><span class="section-icon tone-indigo">{{icon "key"}}</span><div><h2>修改密码</h2><p>更新后需要重新登录</p></div></div>
+      </div>
+    </div>
+    <form method="post" action="/account/password" class="settings-form">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <div class="field">
+        <label for="old-password">当前密码</label>
+        <div class="input-with-button">
+          <input id="old-password" name="old_password" type="password" autocomplete="current-password" required>
+          <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏密码" title="显示或隐藏">{{icon "eye"}}</button>
+        </div>
+      </div>
+      <div class="field-grid">
+        <div class="field">
+          <label for="new-password">新密码</label>
+          <div class="input-with-button">
+            <input id="new-password" name="new_password" type="password" autocomplete="new-password" minlength="8" maxlength="72" required>
+            <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏密码" title="显示或隐藏">{{icon "eye"}}</button>
+          </div>
+          <p class="field-hint">至少 8 个字符，建议混合大小写、数字与符号。</p>
+        </div>
+        <div class="field">
+          <label for="confirm-password">确认新密码</label>
+          <div class="input-with-button">
+            <input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="8" maxlength="72" required>
+            <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏密码" title="显示或隐藏">{{icon "eye"}}</button>
+          </div>
+        </div>
+      </div>
+      <div class="form-actions">
+        <span class="form-hint-inline">{{icon "info"}} 修改成功后，当前会话也会退出。</span>
+        <span class="form-actions-spacer"></span>
+        <button class="btn btn-primary" type="submit">{{icon "check"}} 更新密码</button>
+      </div>
+    </form>
+  </section>
+
+  <div class="settings-column">
+    <section class="card settings-card">
+      <div class="card-head">
+        <div class="card-title">
+          <div class="title-with-icon"><span class="section-icon tone-green">{{icon "shield"}}</span><div><h2>安全策略</h2><p>面板默认启用的保护</p></div></div>
+        </div>
+      </div>
+      <ul class="security-list">
+        <li>
+          <span class="security-check">{{icon "check"}}</span>
+          <div><strong>登录失败锁定</strong><p>连续 5 次密码错误后锁定 15 分钟。</p></div>
+        </li>
+        <li>
+          <span class="security-check">{{icon "check"}}</span>
+          <div><strong>密码哈希存储</strong><p>使用 bcrypt 单向哈希，数据库不保存明文密码。</p></div>
+        </li>
+        <li>
+          <span class="security-check">{{icon "check"}}</span>
+          <div><strong>会话与 CSRF 防护</strong><p>HttpOnly 会话 Cookie，所有写操作均校验 CSRF Token。</p></div>
+        </li>
+        <li>
+          <span class="security-check">{{icon "check"}}</span>
+          <div><strong>严格内容策略</strong><p>CSP 禁止内联脚本与外部资源，静态样式完全自托管。</p></div>
+        </li>
+      </ul>
+    </section>
+
+    <section class="card settings-card">
+      <div class="account-session">
+        <span class="section-icon tone-slate">{{icon "logout"}}</span>
+        <div>
+          <h3>退出当前会话</h3>
+          <p class="field-hint">在公共设备上使用后，请及时退出登录。</p>
+        </div>
+      </div>
+      <form method="post" action="/logout" class="settings-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <button class="btn btn-secondary btn-block" type="submit">{{icon "logout"}} 退出登录</button>
+      </form>
+    </section>
+  </div>
+</div>
+{{end}}

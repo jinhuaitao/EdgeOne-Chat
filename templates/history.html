@@ -1,0 +1,64 @@
+{{define "content"}}
+<section class="card">
+  <div class="card-head">
+    <div class="card-title">
+      <h2>IP 变更记录</h2>
+      <p>每次内容更新都会留下快照</p>
+    </div>
+    <span class="count-pill">共 {{.Total}} 次变更</span>
+  </div>
+
+  {{if .Rows}}
+  <div class="history-list">
+    {{range .Rows}}
+    <article class="history-row">
+      <time class="history-date" datetime="{{rfc3339 .CreatedAt}}">
+        <strong>{{dateOnly .CreatedAt}}</strong>
+        <span>{{clock .CreatedAt}}</span>
+      </time>
+      <span class="history-marker{{if .IsCreate}} is-create{{end}}">{{if .IsCreate}}{{icon "plus"}}{{else}}{{icon "refresh"}}{{end}}</span>
+      <div class="history-main">
+        <div class="history-title">
+          <strong>{{.RecordName}}</strong>
+          <span class="badge badge-{{if eq .RecordType "AAAA"}}violet{{else}}indigo{{end}}">{{.RecordType}}</span>
+          {{if .IsCreate}}<span class="mini-chip">首次创建</span>{{end}}
+        </div>
+        <div class="history-change">
+          {{if .IsCreate}}
+          <span class="muted">记录已创建</span>
+          <code>{{.NewIP}}</code>
+          {{else}}
+          <code>{{.OldIP}}</code>
+          {{icon "arrow-right"}}
+          <code class="is-new">{{.NewIP}}</code>
+          {{end}}
+        </div>
+      </div>
+      <span class="history-ago">{{relTime .CreatedAt}}</span>
+    </article>
+    {{end}}
+  </div>
+
+  <div class="pagination">
+    {{if gt .CurrentPage 1}}
+    <a class="page-btn" href="/history?page={{sub .CurrentPage 1}}">{{icon "chevron-left"}} 上一页</a>
+    {{else}}
+    <span class="page-btn is-disabled">{{icon "chevron-left"}} 上一页</span>
+    {{end}}
+    <span class="page-status">第 {{.CurrentPage}} / {{.TotalPages}} 页</span>
+    {{if lt .CurrentPage .TotalPages}}
+    <a class="page-btn" href="/history?page={{add .CurrentPage 1}}">下一页 {{icon "chevron-right"}}</a>
+    {{else}}
+    <span class="page-btn is-disabled">下一页 {{icon "chevron-right"}}</span>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <span class="empty-illustration">{{icon "history"}}<span class="empty-spark"></span></span>
+    <h3>还没有 IP 变更</h3>
+    <p>当域名指向的 IP 发生变化时，这里会自动保存历史快照。</p>
+    <a class="btn btn-secondary" href="/">{{icon "dashboard"}} 返回概览</a>
+  </div>
+  {{end}}
+</section>
+{{end}}

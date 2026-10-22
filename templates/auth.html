@@ -1,0 +1,45 @@
+{{define "auth-brand"}}
+<aside class="auth-brand">
+  <a class="brand brand-inverse" href="/">
+    <span class="brand-mark">{{icon "cloud"}}</span>
+    <span class="brand-copy">
+      <strong>DDNS Master</strong>
+      <small>Cloudflare DNS</small>
+    </span>
+  </a>
+
+  <div class="auth-brand-copy">
+    <span class="auth-kicker">Cloudflare DDNS · Self-hosted</span>
+    <h1>让每一次 IP 变化，<span>自动抵达</span>你的域名。</h1>
+    <p>一个轻量、自托管的动态域名解析面板。自动检测公网 IP，维护 A / AAAA 记录，并在变化时通知你。</p>
+    <ul class="auth-features">
+      <li>{{icon "refresh"}} 定时自动同步</li>
+      <li>{{icon "globe"}} IPv4 / IPv6 双栈</li>
+      <li>{{icon "send"}} Telegram 即时通知</li>
+    </ul>
+  </div>
+
+  <div class="auth-demo" aria-hidden="true">
+    <div class="auth-demo-head">
+      <span class="demo-live"><span class="live-dot"></span> Live sync</span>
+      <span class="badge badge-success"><span class="badge-dot"></span>已同步</span>
+    </div>
+    <div class="auth-demo-row">
+      <span class="demo-record">{{icon "globe"}}<strong>home.example.com</strong></span>
+      <span class="badge badge-indigo">A</span>
+      <code>203.0.113.42</code>
+    </div>
+    <div class="auth-demo-row is-muted">
+      <span class="demo-record">{{icon "globe"}}<strong>nas.example.com</strong></span>
+      <span class="badge badge-violet">AAAA</span>
+      <code>2001:db8::7</code>
+    </div>
+    <div class="auth-demo-foot">
+      <span><span class="status-dot is-live"></span> Cloudflare 记录已对齐</span>
+      <span>刚刚</span>
+    </div>
+  </div>
+
+  <p class="auth-brand-foot">{{icon "shield"}} 数据仅保存在你的服务器</p>
+</aside>
+{{end}}

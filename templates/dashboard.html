@@ -1,0 +1,408 @@
+{{define "content"}}
+{{if not .HasToken}}
+<section class="notice notice-warning">
+  <span class="notice-icon">{{icon "cloud-off"}}</span>
+  <div class="notice-copy">
+    <strong>尚未配置 Cloudflare Token</strong>
+    <p>填写 API Token 后即可开始自动同步，Token 仅保存在本机数据库中。</p>
+  </div>
+  <a class="btn btn-secondary" href="/settings">{{icon "settings"}} 去配置</a>
+</section>
+{{end}}
+
+<section class="sync-banner{{if .Running}} is-running{{else if gt .LastRunFailed 0}} is-error{{end}}">
+  <div class="sync-banner-copy">
+    <span class="live-pill{{if .HasToken}} is-live{{end}}">
+      <span class="live-dot"></span>
+      {{if .Running}}同步进行中{{else if not .HasToken}}同步未启用{{else if gt .LastRunFailed 0}}存在异常{{else}}系统运行正常{{end}}
+    </span>
+    <h2>{{if not .HasToken}}连接 Cloudflare，开始自动解析{{else if .LastRunAt.IsZero}}等待首次自动同步{{else}}{{if .LastRunSummary}}{{.LastRunSummary}}{{else}}解析状态已是最新{{end}}{{end}}</h2>
+    <p>
+      {{if .LastRunAt.IsZero}}
+      调度器每 {{.IntervalMinutes}} 分钟检查一次域名的真实 IP，发生变化时自动更新 DNS 记录。
+      {{else}}
+      上次同步 {{relTime .LastRunAt}} · 耗时 {{duration .LastRunDuration}} · 更新 {{.LastRunUpdated}} 条{{if gt .LastRunFailed 0}} · 失败 {{.LastRunFailed}} 条{{end}}
+      {{end}}
+    </p>
+  </div>
+  <div class="sync-banner-side">
+    <span class="side-label">下次自动同步</span>
+    {{if and .HasToken (not .Running)}}
+    <strong data-countdown-target="{{countdown .NextSync}}">{{clock .NextSync}}</strong>
+    <span class="side-hint">每 {{.IntervalMinutes}} 分钟检查一次</span>
+    {{else if .Running}}
+    <strong class="is-animated">检查中</strong>
+    <span class="side-hint">完成后自动刷新状态</span>
+    {{else}}
+    <strong>—</strong>
+    <span class="side-hint">配置 Token 后启用</span>
+    {{end}}
+  </div>
+  <div class="sync-banner-art" aria-hidden="true">
+    <span class="orbit orbit-a"></span>
+    <span class="orbit orbit-b"></span>
+    <span class="orbit-core">{{icon "globe"}}</span>
+    <span class="orbit-tag tag-a">A</span>
+    <span class="orbit-tag tag-b">AAAA</span>
+  </div>
+</section>
+
+<section class="stats-grid">
+  <article class="stat-card">
+    <div class="stat-icon tone-indigo">{{icon "globe"}}</div>
+    <div class="stat-copy">
+      <span class="stat-label">托管域名</span>
+      <strong class="stat-value">{{.Stats.Total}}</strong>
+      <span class="stat-foot">{{.Stats.Enabled}} 条启用中</span>
+    </div>
+  </article>
+  <article class="stat-card">
+    <div class="stat-icon tone-green">{{icon "check-circle"}}</div>
+    <div class="stat-copy">
+      <span class="stat-label">同步正常</span>
+      <strong class="stat-value">{{.Stats.Synced}}</strong>
+      <span class="stat-foot">{{if not .Stats.Total}}暂无域名{{else if not .Stats.Enabled}}暂无启用记录{{else if .Stats.Errors}}{{.Stats.Errors}} 条记录需处理{{else if .Stats.Pending}}{{.Stats.Pending}} 条等待同步{{else}}所有启用记录已对齐{{end}}</span>
+    </div>
+  </article>
+  <article class="stat-card">
+    <div class="stat-icon {{if or .Stats.Errors .Stats.Pending}}tone-amber{{else}}tone-slate{{end}}">{{icon "alert"}}</div>
+    <div class="stat-copy">
+      <span class="stat-label">需要留意</span>
+      <strong class="stat-value">{{add .Stats.Errors .Stats.Pending}}</strong>
+      <span class="stat-foot">{{.Stats.Errors}} 异常 · {{.Stats.Pending}} 待同步</span>
+    </div>
+  </article>
+  <article class="stat-card">
+    <div class="stat-icon tone-violet">{{icon "clock"}}</div>
+    <div class="stat-copy">
+      <span class="stat-label">调度周期</span>
+      <strong class="stat-value">{{.IntervalMinutes}}<small> 分钟</small></strong>
+      <span class="stat-foot">{{if .Stats.Disabled}}{{.Stats.Disabled}} 条已停用{{else}}自动巡检已开启{{end}}</span>
+    </div>
+  </article>
+</section>
+
+<section class="card domains-card">
+  <div class="card-head">
+    <div class="card-title">
+      <h2>域名解析</h2>
+      <p>管理 Cloudflare 上的 A / AAAA 记录</p>
+    </div>
+    <div class="card-actions">
+      <span class="count-pill">{{.Stats.Total}} 条记录</span>
+      <button class="btn btn-primary" type="button" data-open-domain>{{icon "plus"}} 添加域名</button>
+    </div>
+  </div>
+
+  {{if .Domains}}
+  <div class="table-wrap domain-table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>记录</th>
+          <th>类型</th>
+          <th>IP 来源</th>
+          <th>当前 IP</th>
+          <th>状态</th>
+          <th>最近检查</th>
+          <th class="align-right">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Domains}}
+        <tr{{if not .Enabled}} class="row-disabled"{{end}}>
+          <td>
+            <div class="record-cell">
+              <span class="record-name">{{.RecordName}}</span>
+              <span class="record-meta">
+                <span>{{icon "cloud"}} {{if .ZoneName}}{{.ZoneName}}{{else}}Cloudflare{{end}}</span>
+                <span class="meta-dot">·</span>
+                <span>{{if .Proxied}}已代理{{else}}仅 DNS{{end}}</span>
+                <span class="meta-dot">·</span>
+                <span>TTL {{.TTLText}}</span>
+              </span>
+            </div>
+          </td>
+          <td><span class="badge badge-{{.TypeTone}}">{{.RecordType}}</span></td>
+          <td>
+            <span class="source-cell">
+              {{if eq .IPSource "interface"}}{{icon "cable"}}{{else}}{{icon "wifi"}}{{end}}
+              <span>{{.SourceText}}</span>
+            </span>
+          </td>
+          <td>
+            {{if .LastIP}}
+            <span class="ip-cell">
+              <code>{{.LastIP}}</code>
+              <button class="icon-btn icon-btn-xs" type="button" data-copy="{{.LastIP}}" title="复制 IP" aria-label="复制 IP">{{icon "copy"}}</button>
+            </span>
+            {{else}}<span class="muted">—</span>{{end}}
+          </td>
+          <td>
+            <div class="status-cell">
+              <span class="badge badge-{{.StatusTone}}"><span class="badge-dot"></span>{{.StatusText}}</span>
+              {{if .LastMsg}}<span class="status-note" title="{{.LastMsg}}">{{.LastMsg}}</span>{{end}}
+            </div>
+          </td>
+          <td><span class="muted-strong" title="{{dateTime .LastCheckAt}}">{{if not .LastCheckAt.IsZero}}{{relTime .LastCheckAt}}{{else}}尚未检查{{end}}</span></td>
+          <td class="align-right">
+            <div class="row-actions">
+              <button class="icon-btn" type="button" title="编辑 {{.RecordName}}" aria-label="编辑 {{.RecordName}}" data-edit-domain
+                data-id="{{.ID}}" data-name="{{.RecordName}}" data-type="{{.RecordType}}"
+                data-source="{{.IPSource}}" data-interface="{{.InterfaceName}}" data-ttl="{{.TTL}}"
+                data-proxied="{{if .Proxied}}true{{else}}false{{end}}" data-create="{{if .CreateIfMissing}}true{{else}}false{{end}}">
+                {{icon "edit"}}
+              </button>
+              <form method="post" action="/domains/{{.ID}}/toggle" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+                <button class="icon-btn{{if .Enabled}} is-warning{{end}}" type="submit" title="{{if .Enabled}}停用{{else}}启用{{end}} {{.RecordName}}" aria-label="{{if .Enabled}}停用{{else}}启用{{end}} {{.RecordName}}">
+                  {{icon "power"}}
+                </button>
+              </form>
+              <form method="post" action="/domains/{{.ID}}/delete" class="inline-form" data-confirm data-confirm-title="移除域名" data-confirm-message="将从面板中移除 {{.RecordName}}。Cloudflare 上的 DNS 记录不会被删除。" data-confirm-label="移除">
+                <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+                <button class="icon-btn is-danger" type="submit" title="移除 {{.RecordName}}" aria-label="移除 {{.RecordName}}">{{icon "trash"}}</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="domain-mobile-list">
+    {{range .Domains}}
+    <article class="domain-mobile-card{{if not .Enabled}} is-disabled{{end}}">
+      <div class="domain-mobile-head">
+        <div class="record-cell">
+          <span class="record-name">{{.RecordName}}</span>
+          <span class="record-meta"><span>{{icon "cloud"}} {{if .ZoneName}}{{.ZoneName}}{{else}}Cloudflare{{end}}</span></span>
+        </div>
+        <span class="badge badge-{{.StatusTone}}"><span class="badge-dot"></span>{{.StatusText}}</span>
+      </div>
+      <div class="domain-mobile-ip">
+        <span class="mobile-label">当前 IP</span>
+        {{if .LastIP}}<code>{{.LastIP}}</code><button class="icon-btn icon-btn-xs" type="button" data-copy="{{.LastIP}}" title="复制 IP" aria-label="复制 IP">{{icon "copy"}}</button>{{else}}<span class="muted">—</span>{{end}}
+      </div>
+      <div class="domain-mobile-meta">
+        <span class="badge badge-{{.TypeTone}}">{{.RecordType}}</span>
+        <span class="source-cell">{{if eq .IPSource "interface"}}{{icon "cable"}}{{else}}{{icon "wifi"}}{{end}}{{.SourceText}}</span>
+        <span class="mini-chip">TTL {{.TTLText}}</span>
+        <span class="mini-chip">{{if .Proxied}}已代理{{else}}仅 DNS{{end}}</span>
+      </div>
+      {{if .LastMsg}}<p class="domain-mobile-msg">{{.LastMsg}}</p>{{end}}
+      <div class="domain-mobile-actions">
+        <button class="btn btn-ghost btn-sm" type="button" data-edit-domain
+          data-id="{{.ID}}" data-name="{{.RecordName}}" data-type="{{.RecordType}}"
+          data-source="{{.IPSource}}" data-interface="{{.InterfaceName}}" data-ttl="{{.TTL}}"
+          data-proxied="{{if .Proxied}}true{{else}}false{{end}}" data-create="{{if .CreateIfMissing}}true{{else}}false{{end}}">
+          {{icon "edit"}} 编辑
+        </button>
+        <form method="post" action="/domains/{{.ID}}/toggle" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+          <button class="btn btn-ghost btn-sm{{if .Enabled}} is-warning{{end}}" type="submit">{{icon "power"}} {{if .Enabled}}停用{{else}}启用{{end}}</button>
+        </form>
+        <form method="post" action="/domains/{{.ID}}/delete" class="inline-form" data-confirm data-confirm-title="移除域名" data-confirm-message="将从面板中移除 {{.RecordName}}。Cloudflare 上的 DNS 记录不会被删除。" data-confirm-label="移除">
+          <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+          <button class="btn btn-ghost btn-sm is-danger" type="submit">{{icon "trash"}} 移除</button>
+        </form>
+      </div>
+    </article>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <span class="empty-illustration">{{icon "globe"}}<span class="empty-spark"></span></span>
+    <h3>还没有托管域名</h3>
+    <p>添加第一个域名，面板会自动检测 IP 并同步到 Cloudflare。</p>
+    <button class="btn btn-primary" type="button" data-open-domain>{{icon "plus"}} 添加第一个域名</button>
+  </div>
+  {{end}}
+</section>
+
+<section class="lower-grid">
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">
+        <h2>最近变更</h2>
+        <p>IP 发生变化时自动记录</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/history">查看全部 {{icon "arrow-right"}}</a>
+    </div>
+    {{if .Recent}}
+    <ul class="activity-list">
+      {{range .Recent}}
+      <li class="activity-item">
+        <span class="activity-marker">{{if .IsCreate}}{{icon "plus"}}{{else}}{{icon "refresh"}}{{end}}</span>
+        <div class="activity-main">
+          <div class="activity-top">
+            <strong>{{.RecordName}}</strong>
+            <span class="badge badge-{{if eq .RecordType "AAAA"}}violet{{else}}indigo{{end}}">{{.RecordType}}</span>
+          </div>
+          <div class="activity-change">
+            {{if .IsCreate}}
+            <span class="muted">首次创建</span> <code>{{.NewIP}}</code>
+            {{else}}
+            <code>{{.OldIP}}</code> {{icon "arrow-right"}} <code>{{.NewIP}}</code>
+            {{end}}
+          </div>
+        </div>
+        <time class="activity-time" title="{{dateTime .CreatedAt}}">{{relTime .CreatedAt}}</time>
+      </li>
+      {{end}}
+    </ul>
+    {{else}}
+    <p class="soft-empty">IP 发生变化后，变更记录会显示在这里。</p>
+    {{end}}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">
+        <h2>运行状态</h2>
+        <p>连接与调度概况</p>
+      </div>
+      <span class="status-dot{{if .HasToken}} is-live{{end}}"></span>
+    </div>
+    <div class="overview-list">
+      <div class="overview-row">
+        <span class="overview-label">{{icon "cloud"}} Cloudflare</span>
+        {{if .HasToken}}<span class="badge badge-info">已配置</span>{{else}}<span class="badge badge-muted">未配置</span>{{end}}
+      </div>
+      <div class="overview-row">
+        <span class="overview-label">{{icon "send"}} Telegram 通知</span>
+        {{if .HasTelegram}}<span class="badge badge-success">已启用</span>{{else}}<span class="badge badge-muted">未配置</span>{{end}}
+      </div>
+      <div class="overview-row">
+        <span class="overview-label">{{icon "clock"}} 下次同步</span>
+        {{if and .HasToken (not .Running)}}
+        <span class="overview-value" data-countdown-target="{{countdown .NextSync}}">{{clock .NextSync}}</span>
+        {{else}}<span class="overview-value muted">—</span>{{end}}
+      </div>
+      <div class="overview-row">
+        <span class="overview-label">{{icon "activity"}} 上次同步</span>
+        <span class="overview-value">{{if not .LastRunAt.IsZero}}{{relTime .LastRunAt}} · {{duration .LastRunDuration}}{{else}}等待首次运行{{end}}</span>
+      </div>
+      <div class="overview-row">
+        <span class="overview-label">{{icon "bolt"}} 面板版本</span>
+        <span class="overview-value">{{.Version}}</span>
+      </div>
+    </div>
+    <div class="overview-actions">
+      <a class="btn btn-ghost btn-sm" href="/settings">{{icon "settings"}} 系统设置</a>
+      <a class="btn btn-ghost btn-sm" href="/logs">{{icon "logs"}} 运行日志</a>
+    </div>
+  </div>
+</section>
+
+<dialog class="modal" id="domain-dialog" aria-labelledby="domain-dialog-title">
+  <form method="post" action="/domains" class="modal-card modal-card-lg" id="domain-form" data-domain-form>
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <input type="hidden" name="id" value="">
+    <div class="modal-head">
+      <span class="modal-badge is-brand">{{icon "globe"}}</span>
+      <div class="modal-head-copy">
+        <h2 id="domain-dialog-title" data-domain-title>添加域名</h2>
+        <p data-domain-subtitle>将域名交给面板自动维护</p>
+      </div>
+      <button class="icon-btn modal-close" type="button" data-close-dialog aria-label="关闭">{{icon "x"}}</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="field">
+        <label for="domain-name">记录域名</label>
+        <div class="input-action">
+          <input id="domain-name" name="record_name" type="text" placeholder="home.example.com" autocomplete="off" spellcheck="false" required>
+          <button class="btn btn-secondary" type="button" data-inspect-domain>{{icon "search"}} 检测</button>
+        </div>
+        <p class="field-hint">填写完整域名，支持泛解析，例如 <code>*.example.com</code>。</p>
+        <div class="inspect-result" data-inspect-result hidden></div>
+      </div>
+
+      <div class="field-grid">
+        <fieldset class="field">
+          <legend>记录类型</legend>
+          <div class="segmented">
+            <label class="segment">
+              <input type="radio" name="record_type" value="A" checked>
+              <span>A · IPv4</span>
+            </label>
+            <label class="segment">
+              <input type="radio" name="record_type" value="AAAA">
+              <span>AAAA · IPv6</span>
+            </label>
+          </div>
+        </fieldset>
+        <fieldset class="field">
+          <legend>IP 来源</legend>
+          <div class="segmented">
+            <label class="segment">
+              <input type="radio" name="ip_source" value="api" checked>
+              <span>自动获取</span>
+            </label>
+            <label class="segment">
+              <input type="radio" name="ip_source" value="interface">
+              <span>本机网卡</span>
+            </label>
+          </div>
+        </fieldset>
+      </div>
+      <p class="field-hint">「自动获取」会依次请求 ipify、icanhazip、ip.sb 获取公网地址，无需填写 API 地址或密钥。</p>
+
+      <div class="field" data-interface-field hidden>
+        <label for="domain-interface">选择网卡</label>
+        <select id="domain-interface" name="interface_name">
+          <option value="">正在读取网卡…</option>
+        </select>
+        <p class="field-hint">读取该网卡上对应协议族的地址，适合内网 DNS 或固定 IPv6。</p>
+      </div>
+
+      <div class="field-grid">
+        <div class="field">
+          <label for="domain-ttl">TTL</label>
+          <select id="domain-ttl" name="ttl">
+            <option value="1">自动</option>
+            <option value="60">1 分钟</option>
+            <option value="120">2 分钟</option>
+            <option value="300">5 分钟</option>
+            <option value="600">10 分钟</option>
+            <option value="1800">30 分钟</option>
+            <option value="3600">1 小时</option>
+          </select>
+          <p class="field-hint" data-ttl-hint>开启 CDN 代理时，Cloudflare 会自动管理 TTL。</p>
+        </div>
+        <div class="switch-stack">
+          <label class="switch-row">
+            <span class="switch-copy">
+              <strong>CDN 代理</strong>
+              <small>显示 Cloudflare 橙色云朵，仅 A/AAAA 生效</small>
+            </span>
+            <span class="switch">
+              <input type="checkbox" name="proxied" value="on">
+              <span class="switch-track"></span>
+            </span>
+          </label>
+          <label class="switch-row">
+            <span class="switch-copy">
+              <strong>自动创建记录</strong>
+              <small>Cloudflare 上不存在时自动创建该记录</small>
+            </span>
+            <span class="switch">
+              <input type="checkbox" name="create_if_missing" value="on" checked>
+              <span class="switch-track"></span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <p class="form-error" data-domain-error hidden></p>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" type="button" data-close-dialog>取消</button>
+      <button class="btn btn-primary" type="submit" data-domain-submit>{{icon "check"}} <span data-domain-submit-label>添加并同步</span></button>
+    </div>
+  </form>
+</dialog>
+{{end}}

@@ -1,0 +1,76 @@
+{{define "install.html"}}<!DOCTYPE html>
+<html lang="zh-CN" data-theme="{{.Theme}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="csrf-token" content="{{.CSRF}}">
+  <meta name="robots" content="noindex, nofollow">
+  <title>初始化 · DDNS Master</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v={{.AssetVersion}}">
+  <script src="/static/app.js?v={{.AssetVersion}}" defer></script>
+</head>
+<body class="auth-body">
+  {{template "icons.html" .}}
+  <div class="auth-shell">
+    {{template "auth-brand" .}}
+    <main class="auth-main">
+      <div class="auth-topline">
+        <a class="brand auth-mobile-brand" href="/">
+          <span class="brand-mark">{{icon "cloud"}}</span>
+          <span class="brand-copy"><strong>DDNS Master</strong><small>Cloudflare DNS</small></span>
+        </a>
+        <button class="icon-btn theme-toggle" type="button" data-theme-toggle data-mode="{{.Theme}}" aria-label="切换主题" title="切换主题">
+          <span class="theme-glyph when-auto">{{icon "monitor"}}</span>
+          <span class="theme-glyph when-light">{{icon "sun"}}</span>
+          <span class="theme-glyph when-dark">{{icon "moon"}}</span>
+        </button>
+      </div>
+
+      <div class="auth-card">
+        <div class="auth-card-head">
+          <span class="auth-card-icon">{{icon "bolt"}}</span>
+          <span class="auth-kicker">第一次启动</span>
+          <h2>初始化面板</h2>
+          <p>创建管理员账号，几秒钟后开始自动维护域名。</p>
+        </div>
+
+        {{if .Error}}<div class="auth-alert is-error" role="alert">{{icon "alert-circle"}}<span>{{.Error}}</span></div>{{end}}
+        {{range .Flashes}}<div class="auth-alert is-{{.Type}}" role="status">{{if eq .Type "success"}}{{icon "check-circle"}}{{else if eq .Type "warning"}}{{icon "alert"}}{{else}}{{icon "info"}}{{end}}<span>{{.Message}}</span></div>{{end}}
+
+        <form method="post" action="/install" class="auth-form">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <div class="field">
+            <label for="install-username">管理员用户名</label>
+            <input id="install-username" name="username" type="text" value="{{.Username}}" placeholder="3–32 个字符" autocomplete="username" autocapitalize="none" spellcheck="false" minlength="3" maxlength="32" required autofocus>
+          </div>
+          <div class="field">
+            <label for="install-password">密码</label>
+            <div class="input-with-button">
+              <input id="install-password" name="password" type="password" placeholder="至少 8 个字符" autocomplete="new-password" minlength="8" maxlength="72" required>
+              <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏密码" title="显示或隐藏">{{icon "eye"}}</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="install-confirm">确认密码</label>
+            <div class="input-with-button">
+              <input id="install-confirm" name="confirm_password" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="8" maxlength="72" required>
+              <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏密码" title="显示或隐藏">{{icon "eye"}}</button>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-block btn-lg" type="submit">{{icon "bolt"}} 创建管理员并进入面板</button>
+        </form>
+
+        <p class="auth-note">{{icon "database"}} 账号与配置保存在本机 SQLite 数据库中</p>
+      </div>
+
+      <footer class="auth-footer">
+        <span>DDNS Master <span class="footer-version">{{.Version}}</span></span>
+        <span class="footer-sep">·</span>
+        <span>初始化完成后即可配置 Cloudflare</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>{{end}}

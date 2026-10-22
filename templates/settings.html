@@ -1,0 +1,168 @@
+{{define "content"}}
+{{if not .HasToken}}
+<section class="notice notice-warning">
+  <span class="notice-icon">{{icon "cloud-off"}}</span>
+  <div class="notice-copy">
+    <strong>请先配置 Cloudflare API Token</strong>
+    <p>Token 需要 <code>Zone:Read</code> 与 <code>Zone.DNS:Edit</code> 权限，保存后即可开始同步。</p>
+  </div>
+  <a class="btn btn-secondary" href="#cloudflare-card">立即配置</a>
+</section>
+{{end}}
+
+<div class="settings-grid">
+  <div class="settings-column">
+    <section class="card settings-card" id="cloudflare-card">
+      <div class="card-head">
+        <div class="card-title">
+          <div class="title-with-icon"><span class="section-icon tone-indigo">{{icon "cloud"}}</span><div><h2>Cloudflare 接入</h2><p>用于读取 Zone 与更新 DNS 记录</p></div></div>
+        </div>
+        {{if .HasToken}}<span class="badge badge-info"><span class="badge-dot"></span>已配置</span>{{else}}<span class="badge badge-muted">未配置</span>{{end}}
+      </div>
+      <form method="post" action="/settings/cloudflare" class="settings-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <div class="field">
+          <label for="cf-token">API Token</label>
+          <div class="input-with-button">
+            <input id="cf-token" name="token" type="password" value="{{.Setting.CFToken}}" placeholder="粘贴 Cloudflare API Token" autocomplete="off" spellcheck="false">
+            <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏 Token" title="显示或隐藏">{{icon "eye"}}</button>
+          </div>
+          <p class="field-hint">
+            在 Cloudflare 控制台创建 API Token，授予 <code>Zone:Read</code> 与 <code>Zone.DNS:Edit</code>。
+            <a class="text-link" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">创建 Token {{icon "external"}}</a>
+          </p>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-secondary" type="button" data-api-test="cloudflare" data-endpoint="/api/test/cloudflare">{{icon "shield"}} 验证 Token</button>
+          <span class="form-actions-spacer"></span>
+          <button class="btn btn-primary" type="submit">{{icon "check"}} 保存配置</button>
+        </div>
+        <p class="test-result" data-test-result="cloudflare" role="status"></p>
+      </form>
+    </section>
+
+    <section class="card settings-card" id="telegram-card">
+      <div class="card-head">
+        <div class="card-title">
+          <div class="title-with-icon"><span class="section-icon tone-sky">{{icon "send"}}</span><div><h2>Telegram 通知</h2><p>IP 变化时第一时间收到消息</p></div></div>
+        </div>
+        {{if .HasTelegram}}<span class="badge badge-success"><span class="badge-dot"></span>已启用</span>{{else}}<span class="badge badge-muted">未配置</span>{{end}}
+      </div>
+      <form method="post" action="/settings/telegram" class="settings-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <div class="field-grid">
+          <div class="field">
+            <label for="tg-token">Bot Token</label>
+            <div class="input-with-button">
+              <input id="tg-token" name="tg_token" type="password" value="{{.Setting.TelegramBotToken}}" placeholder="123456789:AA..." autocomplete="off" spellcheck="false">
+              <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏 Token" title="显示或隐藏">{{icon "eye"}}</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="tg-chat">Chat ID</label>
+            <input id="tg-chat" name="tg_chat_id" type="text" value="{{.Setting.TelegramChatID}}" placeholder="例如 123456789" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-secondary" type="button" data-api-test="telegram" data-endpoint="/api/test/telegram">{{icon "send"}} 发送测试</button>
+          <span class="form-actions-spacer"></span>
+          <button class="btn btn-primary" type="submit">{{icon "check"}} 保存配置</button>
+        </div>
+        <p class="test-result" data-test-result="telegram" role="status"></p>
+      </form>
+    </section>
+
+    <section class="card settings-card" id="schedule-card">
+      <div class="card-head">
+        <div class="card-title">
+          <div class="title-with-icon"><span class="section-icon tone-violet">{{icon "clock"}}</span><div><h2>同步调度</h2><p>控制自动检查 IP 的频率</p></div></div>
+        </div>
+        <span class="badge badge-info">每 {{.IntervalMinutes}} 分钟</span>
+      </div>
+      <form method="post" action="/settings/schedule" class="settings-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <div class="field-row">
+          <div class="field field-compact">
+            <label for="sync-minutes">检查间隔（分钟）</label>
+            <input id="sync-minutes" name="sync_minutes" type="number" min="1" max="1440" step="1" value="{{.Setting.SyncMinutes}}" required>
+            <p class="field-hint">支持 1–1440 分钟，保存后立即重新计算下次运行时间。</p>
+          </div>
+          <div class="schedule-meta">
+            <div class="meta-row"><span>下次运行</span><strong>{{if .HasToken}}{{dateTime .NextSync}}{{else}}—{{end}}</strong></div>
+            <div class="meta-row"><span>上次运行</span><strong>{{if not .LastRunAt.IsZero}}{{relTime .LastRunAt}}{{else}}尚未运行{{end}}</strong></div>
+          </div>
+        </div>
+        <div class="form-actions">
+          <span class="form-hint-inline">{{icon "info"}} 无变化时不会调用写入接口。</span>
+          <span class="form-actions-spacer"></span>
+          <button class="btn btn-primary" type="submit">{{icon "check"}} 保存调度</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div class="settings-column">
+    <section class="card settings-card">
+      <div class="card-head">
+        <div class="card-title">
+          <div class="title-with-icon"><span class="section-icon tone-slate">{{icon "activity"}}</span><div><h2>运行环境</h2><p>当前实例与存储信息</p></div></div>
+        </div>
+      </div>
+      <dl class="info-list">
+        <div class="info-row"><dt>面板版本</dt><dd><span class="code-pill">{{.Version}}</span></dd></div>
+        <div class="info-row"><dt>Go 运行时</dt><dd><span class="code-pill">{{goVersion}}</span></dd></div>
+        <div class="info-row"><dt>运行时长</dt><dd>{{uptime}}</dd></div>
+        <div class="info-row"><dt>托管域名</dt><dd>{{.DomainCount}} 条<span class="muted"> / {{.EnabledCount}} 条启用</span></dd></div>
+        <div class="info-row"><dt>数据目录</dt><dd><code class="path-text" title="{{.DataDir}}">{{.DataDir}}</code></dd></div>
+        <div class="info-row"><dt>数据库</dt><dd><code class="path-text" title="{{.DBPath}}">{{.DBPath}}</code></dd></div>
+        <div class="info-row"><dt>占用空间</dt><dd>{{fileSize .DBSize}}</dd></div>
+      </dl>
+    </section>
+
+    <section class="card settings-card">
+      <div class="card-head">
+        <div class="card-title">
+          <div class="title-with-icon"><span class="section-icon tone-amber">{{icon "database"}}</span><div><h2>备份与恢复</h2><p>迁移配置或保存快照</p></div></div>
+        </div>
+      </div>
+      <div class="settings-form">
+        <div class="backup-block">
+          <div>
+            <h3>导出配置</h3>
+            <p class="field-hint">包含域名、通知与连接配置（含 Token），请妥善保管。</p>
+          </div>
+          <form method="post" action="/settings/backup" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+            <button class="btn btn-secondary" type="submit">{{icon "download"}} 导出 JSON</button>
+          </form>
+        </div>
+        <div class="divider"></div>
+        <form method="post" action="/settings/restore" enctype="multipart/form-data" class="restore-form">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <div>
+            <h3>恢复配置</h3>
+            <p class="field-hint">按域名与记录类型合并，恢复后 Token 变更会触发重新检测。</p>
+          </div>
+          <label class="file-drop" data-file-drop>
+            {{icon "upload"}}
+            <span class="file-drop-copy">
+              <strong data-file-name>选择备份文件</strong>
+              <small>JSON 格式 · 最大 2 MB</small>
+            </span>
+            <input type="file" name="backup_file" accept=".json,application/json" data-file-input required>
+          </label>
+          <button class="btn btn-secondary" type="submit">{{icon "upload"}} 上传并恢复</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="card settings-card security-note">
+      <span class="section-icon tone-green">{{icon "shield"}}</span>
+      <div>
+        <h3>凭据安全</h3>
+        <p>Token 仅存储在本机的 SQLite 数据库中，不会发送到除 Cloudflare 与 Telegram 官方接口以外的任何服务。</p>
+      </div>
+    </section>
+  </div>
+</div>
+{{end}}

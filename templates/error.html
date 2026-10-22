@@ -1,0 +1,46 @@
+{{define "error.html"}}<!DOCTYPE html>
+<html lang="zh-CN" data-theme="{{.Theme}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{.Title}} · DDNS Master</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v={{.AssetVersion}}">
+  <script src="/static/app.js?v={{.AssetVersion}}" defer></script>
+</head>
+<body class="error-body">
+  {{template "icons.html" .}}
+  <div class="error-shell">
+    <header class="error-topline">
+      <a class="brand" href="/">
+        <span class="brand-mark">{{icon "cloud"}}</span>
+        <span class="brand-copy"><strong>DDNS Master</strong><small>Cloudflare DNS</small></span>
+      </a>
+      <button class="icon-btn theme-toggle" type="button" data-theme-toggle data-mode="{{.Theme}}" aria-label="切换主题" title="切换主题">
+        <span class="theme-glyph when-auto">{{icon "monitor"}}</span>
+        <span class="theme-glyph when-light">{{icon "sun"}}</span>
+        <span class="theme-glyph when-dark">{{icon "moon"}}</span>
+      </button>
+    </header>
+
+    <main class="error-card">
+      <span class="error-badge">{{icon "alert"}}</span>
+      <span class="error-code">{{.Status}}</span>
+      <h1>{{.Title}}</h1>
+      <p>{{.Message}}</p>
+      <div class="error-actions">
+        <a class="btn btn-primary" href="/">{{icon "dashboard"}} 返回概览</a>
+        <button class="btn btn-secondary" type="button" data-go-back>返回上一页</button>
+      </div>
+    </main>
+
+    <footer class="error-footer">
+      <span>DDNS Master <span class="footer-version">{{.Version}}</span></span>
+      <span class="footer-sep">·</span>
+      <span>自托管 Cloudflare DDNS</span>
+    </footer>
+  </div>
+</body>
+</html>{{end}}

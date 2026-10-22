@@ -1,0 +1,74 @@
+{{define "login.html"}}<!DOCTYPE html>
+<html lang="zh-CN" data-theme="{{.Theme}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="csrf-token" content="{{.CSRF}}">
+  <meta name="robots" content="noindex, nofollow">
+  <title>登录 · DDNS Master</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v={{.AssetVersion}}">
+  <script src="/static/app.js?v={{.AssetVersion}}" defer></script>
+</head>
+<body class="auth-body">
+  {{template "icons.html" .}}
+  <div class="auth-shell">
+    {{template "auth-brand" .}}
+    <main class="auth-main">
+      <div class="auth-topline">
+        <a class="brand auth-mobile-brand" href="/">
+          <span class="brand-mark">{{icon "cloud"}}</span>
+          <span class="brand-copy"><strong>DDNS Master</strong><small>Cloudflare DNS</small></span>
+        </a>
+        <button class="icon-btn theme-toggle" type="button" data-theme-toggle data-mode="{{.Theme}}" aria-label="切换主题" title="切换主题">
+          <span class="theme-glyph when-auto">{{icon "monitor"}}</span>
+          <span class="theme-glyph when-light">{{icon "sun"}}</span>
+          <span class="theme-glyph when-dark">{{icon "moon"}}</span>
+        </button>
+      </div>
+
+      <div class="auth-card">
+        <div class="auth-card-head">
+          <span class="auth-card-icon">{{icon "shield"}}</span>
+          <h2>欢迎回来</h2>
+          <p>登录以管理你的 Cloudflare 域名解析</p>
+        </div>
+
+        {{if .Error}}<div class="auth-alert is-error" role="alert">{{icon "alert-circle"}}<span>{{.Error}}</span></div>{{end}}
+        {{range .Flashes}}<div class="auth-alert is-{{.Type}}" role="status">{{if eq .Type "success"}}{{icon "check-circle"}}{{else if eq .Type "warning"}}{{icon "alert"}}{{else}}{{icon "info"}}{{end}}<span>{{.Message}}</span></div>{{end}}
+
+        <form method="post" action="/login" class="auth-form">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          {{if .Next}}<input type="hidden" name="next" value="{{.Next}}">{{end}}
+          <div class="field">
+            <label for="login-username">用户名</label>
+            <input id="login-username" name="username" type="text" value="{{.Username}}" placeholder="请输入管理员账号" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+          </div>
+          <div class="field">
+            <label for="login-password">密码</label>
+            <div class="input-with-button">
+              <input id="login-password" name="password" type="password" placeholder="请输入密码" autocomplete="current-password" required>
+              <button class="field-icon-btn" type="button" data-secret-toggle aria-label="显示或隐藏密码" title="显示或隐藏">{{icon "eye"}}</button>
+            </div>
+          </div>
+          <button class="btn btn-primary btn-block btn-lg" type="submit">登录面板 {{icon "arrow-right"}}</button>
+        </form>
+
+        <p class="auth-note">{{icon "shield"}} 连续 5 次登录失败将锁定账号 15 分钟</p>
+
+        <details class="auth-help">
+          <summary>忘记密码？</summary>
+          <p>在服务器终端运行 <code>ddns-panel reset-admin</code>，按提示获取新的随机密码。</p>
+        </details>
+      </div>
+
+      <footer class="auth-footer">
+        <span>DDNS Master <span class="footer-version">{{.Version}}</span></span>
+        <span class="footer-sep">·</span>
+        <span>自托管 Cloudflare DDNS</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>{{end}}

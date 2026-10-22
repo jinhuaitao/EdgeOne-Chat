@@ -1,0 +1,87 @@
+{{define "content"}}
+<section class="card">
+  <div class="card-head">
+    <div class="card-title">
+      <h2>运行日志</h2>
+      <p>同步、通知与异常都会记录在这里</p>
+    </div>
+    <div class="card-actions">
+      <span class="count-pill">{{.Total}} 条</span>
+      {{if .Logs}}
+      <form method="post" action="/logs/clear" class="inline-form" data-confirm data-confirm-title="清空运行日志" data-confirm-message="所有历史运行日志将被永久删除，此操作无法撤销。" data-confirm-label="清空日志">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <button class="btn btn-ghost is-danger" type="submit">{{icon "trash"}} 清空</button>
+      </form>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <div class="filter-chips" aria-label="日志级别筛选">
+      <a class="chip{{if eq .Level ""}} is-active{{end}}" href="/logs{{if .Query}}?q={{urlquery .Query}}{{end}}">全部</a>
+      <a class="chip{{if eq .Level "SUCCESS"}} is-active{{end}}" href="/logs?level=SUCCESS{{if .Query}}&amp;q={{urlquery .Query}}{{end}}"><span class="chip-dot is-success"></span>成功</a>
+      <a class="chip{{if eq .Level "INFO"}} is-active{{end}}" href="/logs?level=INFO{{if .Query}}&amp;q={{urlquery .Query}}{{end}}"><span class="chip-dot is-info"></span>信息</a>
+      <a class="chip{{if eq .Level "WARN"}} is-active{{end}}" href="/logs?level=WARN{{if .Query}}&amp;q={{urlquery .Query}}{{end}}"><span class="chip-dot is-warning"></span>警告</a>
+      <a class="chip{{if eq .Level "ERROR"}} is-active{{end}}" href="/logs?level=ERROR{{if .Query}}&amp;q={{urlquery .Query}}{{end}}"><span class="chip-dot is-danger"></span>错误</a>
+    </div>
+    <form class="filter-search" method="get" action="/logs">
+      <input type="hidden" name="level" value="{{.Level}}">
+      <label class="search-field">
+        <span class="search-icon">{{icon "search"}}</span>
+        <input type="search" name="q" value="{{.Query}}" placeholder="搜索日志内容" aria-label="搜索日志内容">
+      </label>
+      <button class="btn btn-secondary" type="submit">搜索</button>
+    </form>
+  </div>
+
+  {{if .Logs}}
+  <div class="table-wrap">
+    <table class="data-table logs-table">
+      <thead>
+        <tr>
+          <th class="col-time">时间</th>
+          <th class="col-level">级别</th>
+          <th>内容</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Logs}}
+        <tr>
+          <td>
+            <div class="log-time">
+              <strong>{{clock .CreatedAt}}</strong>
+              <span>{{dateOnly .CreatedAt}}</span>
+            </div>
+          </td>
+          <td>
+            <span class="badge badge-{{if eq .Level "SUCCESS"}}success{{else if eq .Level "ERROR"}}danger{{else if eq .Level "WARN"}}warning{{else}}info{{end}}">
+              <span class="badge-dot"></span>{{.Level}}
+            </span>
+          </td>
+          <td>
+            <div class="log-message">{{.Message}}</div>
+            <span class="log-ago">{{relTime .CreatedAt}}</span>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  <p class="table-footnote">显示最近 {{.Shown}} 条日志，当前筛选共 {{.Total}} 条。旧日志会自动清理。</p>
+  {{else if .Total}}
+  <div class="empty-state">
+    <span class="empty-illustration">{{icon "search"}}<span class="empty-spark"></span></span>
+    <h3>没有匹配的日志</h3>
+    <p>尝试更换级别或搜索关键词。</p>
+    <a class="btn btn-secondary" href="/logs">查看全部日志</a>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <span class="empty-illustration">{{icon "logs"}}<span class="empty-spark"></span></span>
+    <h3>日志还是空的</h3>
+    <p>完成一次同步后，运行结果会显示在这里。</p>
+    <a class="btn btn-secondary" href="/">{{icon "dashboard"}} 返回概览</a>
+  </div>
+  {{end}}
+</section>
+{{end}}
