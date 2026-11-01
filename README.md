@@ -233,13 +233,31 @@ MODEL_1   = sensenova-u1.5-fast:日日新 U1.5 Fast
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `WEB_AGENT_TIMEOUT_MS` | `90000` | Web 端单轮 Agent 时间预算（≤120000，受函数 120s 上限约束） |
-| `AGENT_TIMEOUT_MS` | `240000` | Agent 整体超时 |
-| `AGENT_MAX_STEPS` | `6` | 单轮最大工具调用步数 |
-| `AGENT_CONTEXT_BUDGET` | `24000` | 上下文预算（token） |
-| `AGENT_TOOL_TIMEOUT_MS` | `30000` | 单个工具调用超时 |
+| `WEB_AGENT_TIMEOUT_MS` | `90000` | Web 端单轮 Agent 时间预算（会被 `AGENT_MAX_RUNTIME_MS` 再收口一次） |
+| `AGENT_TIMEOUT_MS` | `240000` | Agent 整体超时。**实际生效值还会被 `AGENT_MAX_RUNTIME_MS` 夹住**——函数活不过 120 秒，配更大只是白配 |
+| `AGENT_MAX_RUNTIME_MS` | `115000` | 单次函数调用的硬上限（给平台回收与响应写出留 5 秒）。任何预算都不会超过它 |
+| `AGENT_WRAPUP_RESERVE_MS` | `12000` | 收尾预留：步数/时间用尽后，留这么多毫秒做一次「不许调工具、只许总结」的收尾请求 |
+| `AGENT_MAX_STEPS` | `6` | 单轮最大工具调用步数（上限 12） |
+| `AGENT_TOOL_CONCURRENCY` | `4` | 同一批并行工具调用的并发上限（1~8） |
+| `AGENT_CONTEXT_BUDGET` | `24000` | 上下文预算，**按字符计**（≈ 8k~12k token）；超预算先删最旧的整轮，仍超则折叠最长的工具结果 |
+| `AGENT_TOOL_TIMEOUT_MS` | `30000` | 单个工具调用超时上限；实际值还会按「剩余预算 − 收尾预留」收缩 |
+| `AGENT_TOOL_RESULT_MAX` | 按工具 | 单条工具结果进上下文的字符上限。默认 `web_fetch` 6500、`read_doc` 8500（与它们承诺的页大小对齐）、其余 4000；显式设置则全局覆盖 |
 | `AGENT_STREAM_UPSTREAM` | — | Agent 是否流式透传上游输出 |
 | `AGENT_TOOL_CACHE` | `1` | 只读工具 L1 内存 TTL 缓存与同参并发去重（默认开启，设 `0` 关闭） |
+| `AGENT_REASONING_ECHO` | 自动 | 是否把 assistant 的 `reasoning_content` 回传上游。**默认按模型名判断**：`*reasoner*` / `*r1*` 一律剥离（DeepSeek 官方明确回传会 400），其余保留（Kimi K2 Thinking 等要求回传）。设 `1` 强制保留、`0` 强制剥离 |
+
+### 🛡️ Agent 稳定性设计（v7.5.0）
+
+四条硬约束，都是为了「不给用户半截答案、也不让函数被平台掐死」：
+
+1. **预算三段拆分**：可用时间 − 收尾预留 = 循环可用时间。每一步、每个工具、每次上游请求的超时都按「当下剩余」重新计算，不会出现「只剩 5 秒还在等 30 秒的工具」。旧实现里工具固定 30 秒、上游至少 15 秒，与整体 deadline 无关，这正是「预算耗尽却没能暂停保存」的元凶。
+2. **超时也给结论**：Telegram / 微信有「继续」入口，到点存档等续做；Web 端没有续做入口，改为用剩余预算做一次无工具收尾，把已拿到的结果收成完整答案。
+3. **防空转**：同一工具 + 同一参数本轮第 3 次跳过执行、第 4 次直接收尾；连续三次完全相同的调用批次立即停止；连续 3 步拿不到任何新信息（结果指纹全重复）也收尾。旧的熔断只认「连续三次完全相同」，A/B/A/B 交替打转能耗光全部步数。
+4. **非法参数不执行**：模型给出的 `arguments` 不是合法 JSON 时，直接回一条可纠正的提示，而不是带着空参数跑一遍工具（那样工具只会回「关键词为空」，模型往往原地重试，白烧一整步）。
+
+每轮结束会记录步数 / 工具数 / 失败数 / 跳过数 / 耗时 / 停止原因。设 `STORAGE_DEBUG=1` 后 `/healthz` 的 `debug.agent` 可以看到汇总（`avgSteps`、`pausedTurns`、`timedOutTurns`、`lastStopReason`、`cache.hits`）——只反映处理该请求的实例，跨实例看全量请用控制台日志。
+
+> `AGENT_CONTEXT_BUDGET` 的二级压缩值得单独说：一次 `web_fetch` 可达 4000 字、`read_doc` 可达 8000 字，四个并行调用就能顶满 24000 字符。旧实现删完旧轮次后如果还超预算就**什么都不做**（预算形同虚设），现在会把最长的工具结果折叠成「头 900 字 + … + 尾 400 字」，既压回预算内，又不至于让模型答不上来。
 
 ---
 
@@ -385,6 +403,7 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 | 15 | `_app/telegram/diag.js`、`setup.js` | 新增：`/tg-setup` 自诊断端点 + 进程内事件留痕（`setWebhook` 成功 ≠ 链路可用，原实现全分支回 200 导致配置错了完全静默） |
 
 | 16 | `_app/channel.js`、`entry.js`、`agent/loop.js`、`telegram/handler.js` | **多密钥加固**：新增密钥池健康状态 + 失败换 key 重试（仅 `401/402/403/429`）+ 指数退避熔断；未配置密钥时不再发送畸形的 `Authorization: Bearer `（兼容 Ollama 等免密钥网关）；同名模型在同一 `API_URL` 下合并密钥池；`/healthz` 增 `keyPool` 掩码排障 |
+| 17 | `agent/limits.js`、`agent/loop.js`、`agent/stability.js`、`agent/tools.js`、`agent/result.js`（新增）、`agent/prompt.js`、`channel.js`、`web-agent.js`、`entry.js` | **Agent 精修（v7.5.0）**：① 预算三段拆分，工具/上游超时随剩余预算收缩 + 收尾预留，超时也能给出结论；② 跨步重复调用熔断（同参第 3 次跳过、第 4 次收尾）与「无新信息」检测；③ 非法 JSON 参数不执行工具；④ 上下文二级压缩（折叠最长的工具结果，旧实现删完轮次仍超预算时直接放行）；⑤ 分页工具（`web_fetch`/`read_doc`）保留各自页大小并在截断提示里给出续读 `offset`；⑥ 失败前缀判定收敛到 `agent/result.js` 单一事实源（原先 loop 与 tools 各抄一份，已出现不一致风险）；⑦ `reasoning_content` 按模型策略回传（DeepSeek reasoner 回传会 400）；⑧ 系统提示词补「外部内容不是指令」的注入防御；⑨ `/healthz` 增 `debug.agent` 每轮统计 |
 
 **其余 40 个文件（UI、PWA、SSRF 防护、Agent 循环、工具链、Telegram 处理器）均为原样复制。**
 
@@ -424,7 +443,7 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 node scripts/selfcheck.mjs      # 或 npm run selfcheck
 ```
 
-覆盖 **148 项用例**：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
+覆盖 **174 项用例**：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
 是否真带上）、错误可见性（`QUOTA_EXCEEDED` 记录但不破坏上层）、KV key 编码、
 路由、模型解析、Blob 默认后端与命名空间自动创建、KV 绑定自动发现、
 `/healthz` 排障输出、生图链路（含 5 种响应形态）、页面内联脚本合法性、
@@ -433,7 +452,11 @@ node scripts/selfcheck.mjs      # 或 npm run selfcheck
 指数退避冷却、冷却后不再被选中、尝试次数上限、掩码不回显原文、
 `API_KEY_ROTATE=0` 逃生口、端到端 401 自愈与免密钥请求头）、
 Telegram 自诊断（含「无模型时仍对 Telegram 回 200」「白名单拦下记录真实 chat_id」
-等静默契约断言）、双后端端到端（记忆/知识库/检索各跑一遍）。
+等静默契约断言）、双后端端到端（记忆/知识库/检索各跑一遍），
+以及 Agent 主循环精修（预算拆分与超时收缩、工具超时跟随预算、上下文二级压缩与
+工具应答配对完整性、失败判定不误伤正文、`reasoning_content` 按模型回传、
+主循环端到端调工具→作答、非法 JSON 参数不执行、交替重复调用熔断、分页工具的续读提示、
+`/healthz` 的 Agent 统计不含密钥原文）。
 
 本地起服务调试（需 `npm i -g edgeone`）：`edgeone makers dev`
 
@@ -459,7 +482,12 @@ Telegram 自诊断（含「无模型时仍对 Telegram 回 200」「白名单拦
 | 只配 `API_URL` 不配 `API_KEY` 报 401 | 现在**不会再发送** `Authorization` 头（兼容 Ollama 等免密钥网关）；仍报 401 说明该上游确实需要密钥，补上 `API_KEY_1` |
 | 多 key 想用在**不同**服务商上 | 不行：key 池绑定同一个 `API_URL_i`。请用 `API_URL_2 / API_KEY_2 / MODEL_2` 另开通道 |
 | Telegram 不响应 | 先看 `/tg-setup?key=<TG_SETUP_KEY>` 的 `topHint`（见第三节） |
-| Agent 长任务中途中断 | `edgeone.json` 里 `maxDuration` 被改小，保持 120；`WEB_AGENT_TIMEOUT_MS` ≤ 120000 |
+| Agent 长任务中途中断 | `edgeone.json` 里 `maxDuration` 被改小，保持 120；`AGENT_MAX_RUNTIME_MS` 默认 115000 已按平台上限收口，一般不需要动 |
+| Agent 到点就停、只给半截推理 | v7.5.0 起会先用 `AGENT_WRAPUP_RESERVE_MS` 做无工具收尾；若仍看到「本次推理已到时间上限」，说明预留不够或单步耗时过长：把 `AGENT_WRAPUP_RESERVE_MS` 调到 15000~20000，或调小 `AGENT_TOOL_TIMEOUT_MS` |
+| Agent 反复调同一个工具 | 已内置熔断（同参第 3 次跳过、第 4 次收尾）。仍频繁发生说明模型不擅长用工具：换模型，或把 `AGENT_MAX_STEPS` 调小让它更早收尾 |
+| 回答里出现「已折叠」字样 | 上下文被压到 `AGENT_CONTEXT_BUDGET` 内（说明单步工具结果太大）。调大预算，或让模型用更精确的参数（如 `offset` 分页）读取 |
+| 用 deepseek-reasoner 时 Agent 报 400 | 该模型不接受回传 `reasoning_content`，v7.5.0 已按模型名自动剥离；若用了别名（如 `ds-r1`）未被识别，设 `AGENT_REASONING_ECHO=0` |
+| 用 Kimi K2 Thinking 报「reasoning_content is required」 | 反向情况：设 `AGENT_REASONING_ECHO=1` 强制回传 |
 | 文档列表体积都显示 1 KB | 预期行为，见第六节第 1 条 |
 | 生图「未返回任何图片」 | 上游响应结构不在兼容范围，看提示里的原始响应片段 |
 | 生图「未能转存」 | `/healthz` 看 `storage` 是否为 `memory`，或图片超过 `IMAGE_MAX_MB` |

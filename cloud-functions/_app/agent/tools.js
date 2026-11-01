@@ -4,6 +4,7 @@ import { toolWebSearch, toolWebFetch, toolGithubLookup, toolArxivSearch, toolTre
 import { toolCalculate, toolGetTime, toolGetWeather, toolExchangeRate, toolWikiLookup, toolUnitConvert, toolTextToolkit, toolNetworkLookup } from './tools-local.js';
 import { agentSaveMemory, agentForgetMemory } from './memory.js';
 import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+import { isToolFailure } from './result.js';
 
 // ==================== 工具结果 L1 缓存与同参并发去重 ====================
 // 对幂等只读工具进行短期缓存（仅缓存成功结果，失败结果绝不缓存），
@@ -39,9 +40,8 @@ function canonicalizeArgs(args) {
 }
 
 function isCacheableToolSuccess(result) {
-  const s = String(result == null ? '' : result);
-  if (!s) return false;
-  return !/^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|单位换算失败|文本工具执行失败|网络查询失败|GitHub 查询失败|GitHub 未找到|arXiv 检索失败|arXiv 未找到|热榜获取失败|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
+  // 失败判定统一走 result.js，避免「循环层当失败、缓存层当成功」的分裂
+  return !isToolFailure(result);
 }
 
 function clearAgentToolCache() {
@@ -383,7 +383,7 @@ async function runRawAgentTool(name, args, env, chatId) {
   }
 }
 
-async function execAgentTool(name, args, env, chatId, kbReadOnly) {
+async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
   args = args || {};
   env = env || {};
   // v6.9.3 / v7.0.0 执行层硬校验：Web 端（kbReadOnly）即使模型幻觉出写入类工具调用，也绝不执行
@@ -414,6 +414,11 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly) {
 
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
   if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
+  // v7.5.0：工具超时不再是一个与整体预算无关的常数。
+  // 循环层会把「剩余预算 - 收尾预留」算好传进来，工具最多只能用这么多时间，
+  // 否则会出现「只剩 5 秒还在等 30 秒的工具 → 函数被平台掐断 → 断点没存上」。
+  const budgetMs = opts && opts.budgetMs > 0 ? opts.budgetMs : 0;
+  if (budgetMs && budgetMs < toolTimeoutMs) toolTimeoutMs = Math.max(1500, budgetMs);
 
   const execPromise = (async () => {
     let timer;

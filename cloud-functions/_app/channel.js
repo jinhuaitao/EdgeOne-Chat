@@ -324,6 +324,23 @@ function buildImagePayload(env, model, prompt) {
   return p;
 }
 
+// ======= 推理内容（reasoning_content）是否回传上游 =======
+// 背景：Agent 循环会把每步 assistant 的 reasoning_content 留在消息里（用于续做与展示）。
+// 但把这份推理再塞回上游，对不同厂商是相反的要求：
+//   · DeepSeek 官方明确说明：输入消息里出现 reasoning_content 字段会直接返回 400；
+//   · Kimi K2 Thinking 一类模型则要求工具调用轮次必须把 reasoning_content 传回，
+//     否则会报「reasoning_content is required」。
+// 所以默认按模型名判断，并留一个环境变量强制覆盖：
+//   AGENT_REASONING_ECHO=1 一律回传（给要求回传的厂商）
+//   AGENT_REASONING_ECHO=0 一律剥离（给不接受该字段的厂商）
+function shouldEchoReasoning(env, modelId) {
+  const v = String((env && env.AGENT_REASONING_ECHO) || '').trim().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'on' || v === 'yes') return true;
+  if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false;
+  const id = String(modelId || '').toLowerCase();
+  return !/reasoner|(^|[-_/.])r1([-_/.]|$)/.test(id);
+}
+
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
 // tools: 可选，OpenAI 兼容的 tools 数组（Agent 模式用）；图片通道自动忽略
 function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
@@ -351,6 +368,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   let apiPath = apiUrl;
   try { apiPath = new URL(apiUrl).pathname; } catch (e) {}
   const isImageAPI = /\/images\/(generations|edits)(\/|$)/.test(apiPath) || apiUrl.includes('images/generations');
+  const echoReasoning = shouldEchoReasoning(env, selectedModel);
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
@@ -379,7 +397,8 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
       const o = { role: m.role, content: m.content };
       if (m.tool_calls) o.tool_calls = m.tool_calls;
       if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; if (m.name) o.name = m.name; }
-      if (m.reasoning_content) o.reasoning_content = m.reasoning_content;
+      // v7.5.0：推理内容按模型策略决定是否回传（见 shouldEchoReasoning）
+      if (m.reasoning_content && echoReasoning) o.reasoning_content = m.reasoning_content;
       return o;
     }),
     stream: isStream,
@@ -407,5 +426,6 @@ export {
   authHeaders,
   isKeyRetryableStatus,
   keyPoolStatus,
+  shouldEchoReasoning,
   __resetKeyHealth,
 };

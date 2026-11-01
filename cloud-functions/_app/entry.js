@@ -16,6 +16,7 @@ import { hitRateLimit } from './rate-limit.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders, keyPoolStatus } from './channel.js';
 import { readErrorBody } from './agent/stability.js';
 import { handleWebAgent } from './web-agent.js';
+import { agentTurnStats } from './agent/loop.js';
 import { handleTgWebhook } from './telegram/handler.js';
 import { handleTgSetup } from './telegram/setup.js';
 import { handleWxWebhook, handleWxApi, maybeWakeWxDaemon } from './wechat/handler.js';
@@ -101,6 +102,9 @@ async function routeRequest(request, env, ctx) {
           try { debug.probe = await probeStore(); } catch (e) {}
         }
         try { debug.keyPool = keyPoolStatus(env); } catch (e) {}
+        // v7.5.0：Agent 每轮统计（步数 / 工具数 / 失败数 / 缓存命中 / 停止原因）。
+        // 只反映「处理这个请求的实例」，跨实例看全量请用控制台日志。
+        try { debug.agent = agentTurnStats(); } catch (e) {}
         payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });

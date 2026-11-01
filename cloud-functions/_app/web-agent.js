@@ -2,6 +2,7 @@
 
 import { SSE_HEADERS } from './constants.js';
 import { tgAgentChat } from './agent/loop.js';
+import { agentLimits } from './agent/limits.js';
 
 // ==================== Web 端 Agent（v6.6.0，v6.9.3 只读权限分域） ====================
 // 与 Telegram 共用 tgAgentChat（提供联网搜索、网页抓取、计算、天气、时间及知识库只读检索），
@@ -23,6 +24,11 @@ async function handleWebAgent(env, body) {
   let webBudgetMs = parseInt(env.WEB_AGENT_TIMEOUT_MS || '90000', 10);
   if (!(webBudgetMs >= 10000)) webBudgetMs = 90000;
   if (webBudgetMs > 240000) webBudgetMs = 240000;
+  // v7.5.0：再大也大不过函数存活时间。旧实现允许配到 240 秒，而 Cloud Functions
+  // 上限是 120 秒 —— 真按 240 秒跑，函数会被平台直接掐断，前端只看到连接断开，
+  // 既没有答案也没有任何错误原因。这里按平台上限收口，超时至少能走收尾流程。
+  const runtimeCap = agentLimits(env).runtimeCapMs;
+  if (webBudgetMs > runtimeCap) webBudgetMs = runtimeCap;
 
   const stream = new ReadableStream({
     async start(controller) {
