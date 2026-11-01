@@ -59,7 +59,9 @@ function upstreamTimeoutMs(deadline, now, opts) {
 // web_fetch 单页 6000 字符、read_doc 单页 8000 字符 —— 这两个工具自己就承诺了页大小，
 // 再按统一的 4000 砍一半，等于「工具让你读 8000，循环只给你 4000」，
 // 用户看到的就是「文档读了一半」。所以按工具给默认值，环境变量可整体覆盖。
-const TOOL_RESULT_MAX_BY_NAME = { read_doc: 8500, web_fetch: 6500 };
+// search_docs 一次最多回 3 段（每段命中前后共 1100 字）+ 文件头 + 续读提示，
+// 按 4000 砍会把最后那篇和「怎么继续读」的提示一起切掉，故给 6000。
+const TOOL_RESULT_MAX_BY_NAME = { read_doc: 8500, web_fetch: 6500, search_docs: 6000 };
 function toolResultMax(env, name) {
   const v = parseInt((env && env.AGENT_TOOL_RESULT_MAX) || '', 10);
   if (v > 0) return v;
@@ -88,6 +90,7 @@ function describeToolCall(name, args) {
     case 'forget_memory': return '🗑️ 正在清理记忆：' + (args.keyword || '');
     case 'save_doc': return '💾 正在保存文档：' + (args.title || '');
     case 'list_docs': return '📚 正在查看知识库文档…';
+    case 'search_docs': return '🔎 正在检索知识库：' + (args.query || '');
     case 'read_doc': return '📖 正在读取文档：' + (args.query || '') + offNote;
     case 'delete_doc': return '🗑️ 正在删除文档：' + (args.query || '');
     default: return '⚙️ 正在调用：' + name;

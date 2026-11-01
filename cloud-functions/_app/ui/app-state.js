@@ -230,10 +230,12 @@ export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
   function renderAgentToggle() {
     if (!agentToggle) return;
     agentToggle.classList.toggle('active', agentMode);
-    agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
+    // 文案放在 .at-lbl 里而不是整块 textContent：窄屏会隐藏 .at-lbl 只留图标
+    var lbl = agentToggle.querySelector('.at-lbl');
+    if (lbl) lbl.textContent = agentMode ? 'Agent 开' : 'Agent';
     agentToggle.title = agentMode
-      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
-      : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';
+      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间）。知识库始终优先（无开关）；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
+      : 'Agent 模式已关闭：普通对话，不调用工具；知识库仍然优先检索。点击开启。';
   }
   if (agentToggle) {
     agentToggle.addEventListener('click', () => {
@@ -243,5 +245,13 @@ export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
     });
     renderAgentToggle();
   }
+
+  // v7.8.0：知识库改为「Web 端始终优先读取」，不再提供开关。
+  // 之前那个 📚 开关解决的问题是「不想每次都查库」；但实测下来关掉它的用户
+  // 多半是误触（按钮就在 Agent 旁边），结果回答质量断崖式下跌且没人知道原因。
+  // 现在服务端恒定预检索（入口仍在 entry.js / web-agent.js，供外部调用与
+  // WEB_KB_FIRST=0 全局关闭使用）。顺手清掉历史遗留的偏好，避免升级后
+  // 浏览器里还留着 eochat_kb_first=0 这种「看不见的关闭状态」。
+  try { localStorage.removeItem('eochat_kb_first'); } catch (e) {}
 
 `;

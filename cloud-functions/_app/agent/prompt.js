@@ -15,7 +15,9 @@ function memoryTokens(s) {
 }
 
 // 构建 Agent 系统提示词（记忆按【相关性 + 新近度】排序注入，而非只取最新）。
-function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
+// kbPrefetchText：预检索到的正文片段（见 kb/prefetch.js）。有它时模型不必再花一步
+// search_docs —— 也堵住了「只看了标题列表就凭训练知识作答」这条最隐蔽的漏读路径。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText) {
   const now = new Date();
   let timeStr = '';
   try {
@@ -23,15 +25,19 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   } catch (e) { timeStr = now.toISOString(); }
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
+  const prefetchText = String(kbPrefetchText || '').trim();
+  const hasPrefetch = prefetchText.length > 0;
   let p = '你是 EdgeOne-Chat 智能助手，一个具备自主规划、工具调用和知识库检索能力的 AI Agent。\n';
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   const kbToolClause = hasKb
-    ? '问题涉及知识库文档 → 直接 read_doc 读相关文档（标题列表已在下方【知识库文档列表】给出，无需先 list_docs；超长文档可传 offset 分页续读；标题对不上时 read_doc 会自动用多关键词搜全库正文），内容优先引用并注明"据知识库文档《xxx》"'
-    : '用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（支持 offset 分页续读与多关键词搜正文），文档内容优先引用并注明"据知识库文档《xxx》"';
+    ? '问题涉及知识库文档 → 列表里已有标题：明确对应某篇就直接 read_doc 读原文（长文档首次返回会带【章节目录】，可传 offset 跳到某节，不必逐页翻）；只是"想确认讲过没讲过"或不确定是哪一篇 → 先 search_docs 检索全文拿片段，再决定读哪篇；超长文档可传 offset 分页续读；标题对不上时 read_doc 会自动退回全库检索。内容优先引用并注明"据知识库文档《xxx》"'
+    : '用户问题可能涉及知识库文档主题 → 先用 search_docs 按关键词检索全文（比逐篇 list_docs 更准）；确认有相关文档后再 read_doc 细读（支持 offset 分页与章节目录跳读）。文档内容优先引用并注明"据知识库文档《xxx》"';
   p += '【工作方式】\n'
-    + (hasKb
-      ? '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先对照下方【知识库文档列表】：与某篇文档相关 → 必须 read_doc 读原文后以其内容作答；无关且属于稳定知识 → 直接回答。工具是稀缺资源，能不用就不用。\n'
-      : '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n')
+    + (hasPrefetch
+      ? '1. 意图判断：下方【知识库预检索结果】是系统已经按你的问题检索好的正文片段——先读完它，能回答就直接据此作答（注明"据知识库文档《标题》"），不要再调 search_docs 重复检索；片段明显不完整或需要看上下文时，才用 read_doc 读原文（可传 offset 翻页）。预检索与问题无关时，再按常规流程判断。\n'
+      : hasKb
+        ? '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先对照下方【知识库文档列表】（已按与本问题的相关性排序）：与某篇明显相关 → 必须 read_doc 读原文后以其内容作答；主题沾边但不确定是哪篇 → 先 search_docs 检索全文片段，再决定读哪篇；无关且属于稳定知识 → 直接回答。工具是稀缺资源，能不用就不用。\n'
+        : '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n')
     + (kbReadOnly
       ? '2. 工具选择：需要最新/实时信息（新闻、赛事等）→ web_search；想深入了解某条网页结果 → web_fetch 读结构化正文（长文可用 offset 翻页）；查百科概念/人物/历史背景 → wiki_lookup；查 GitHub 开源仓库详情或高星项目 → github_lookup；查学术论文（AI/计算机/物理/数学）→ arxiv_search；看 Hacker News 实时科技热榜或 GitHub 飙升榜 → trending_news；查实时法币汇率换算或加密货币行情 → exchange_rate；任何数学/统计/组合计算 → calculate（支持 sqrt/log/sin/pow/round/std/median/gcd/comb/pi 等，不要心算）；物理单位或进制转换 → unit_convert；字数统计/哈希摘要/Base64/URL编解码/生成UUID → text_toolkit；查 IP 归属地/ASN 或域名 DNS 记录 → network_lookup；查天气 → get_weather；查当前时间或推算日期差/N天后是哪天 → get_time；' + kbToolClause + '。注意：知识库在本端只读，没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具；用户提出这类请求时，如实说明该操作仅在 Telegram 端支持、请通过 Telegram 机器人完成，绝不假装已记住或已保存。\n'
       : '2. 工具选择：需要最新/实时信息（新闻、赛事等）→ web_search；想深入了解某条网页结果 → web_fetch 读结构化正文（长文可用 offset 翻页）；查百科概念/人物/历史背景 → wiki_lookup；查 GitHub 开源仓库详情或高星项目 → github_lookup；查学术论文（AI/计算机/物理/数学）→ arxiv_search；看 Hacker News 实时科技热榜或 GitHub 飙升榜 → trending_news；查实时法币汇率换算或加密货币行情 → exchange_rate；任何数学/统计/组合计算 → calculate（支持 sqrt/log/sin/pow/round/std/median/gcd/comb/pi 等，不要心算）；物理单位或进制转换 → unit_convert；字数统计/哈希摘要/Base64/URL编解码/生成UUID → text_toolkit；查 IP 归属地/ASN 或域名 DNS 记录 → network_lookup；查天气 → get_weather；查当前时间或推算日期差/N天后是哪天 → get_time；用户明确告知的长期事实 → remember（同一主题改口直接记新值，旧记忆自动覆盖）；用户明确要求忘掉/删除某条记忆 → forget_memory；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新；同一网址只保存一次）；用户明确要求删除文档 → delete_doc；' + kbToolClause + '。\n')
@@ -44,20 +50,43 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
     + '- 重要结论先行，结构清晰，适合手机阅读；代码用代码块。\n'
     + '- 引用网络信息给出结论即可，不必罗列链接（除非用户要求）；数据注明来源与时间（如"据今日搜索"），不确定的信息明确标注。\n\n';
   if (hasKb) {
+    // 按「与本次提问的相关性」排序后再截断。
+    // 旧实现按注册表插入顺序取前 60 篇：知识库一大，最相关的那篇很可能正好被截在
+    // 60 名之外 —— 模型压根不知道它存在，于是答"知识库没提过"。这是最隐蔽的漏读。
+    const qTokens = memoryTokens(query);
+    const scored = kbList.map((e) => {
+      const hay = new Set(memoryTokens(String(e.title || e.file || '') + ' ' + String(e.source || '')));
+      let s = 0;
+      for (const t of qTokens) if (hay.has(t)) s += t.length >= 2 ? 2 : 1;
+      const ts = Date.parse(String(e.updated_at || '')) || 0;
+      return { e, s, ts };
+    });
+    scored.sort((a, b) => (b.s - a.s) || (b.ts - a.ts));
     let budget = 3000;
     const shown = [];
-    for (const e of kbList) {
+    for (const item of scored) {
       if (shown.length >= 60 || budget <= 0) break;
-      let line = '- 《' + (e.title || e.file) + '》';
+      const e = item.e;
+      const meta = [];
+      const date = String(e.updated_at || '').slice(0, 10);
+      if (date) meta.push(date);
       const src = String(e.source || '');
-      if (src) line += '（来源：' + src.slice(0, 120) + '）';
+      if (src) meta.push('来源：' + src.slice(0, 120));
+      const line = '- 《' + (e.title || e.file) + '》' + (meta.length ? '（' + meta.join('，') + '）' : '');
       if (line.length > budget) break;
       shown.push(line);
       budget -= line.length;
     }
-    p += '【知识库文档列表】（共' + kbList.length + '篇' + (shown.length < kbList.length ? '，列出前' + shown.length + '篇，其余可 list_docs 查看' : '') + '）\n'
-      + '回答问题前先核对此列表：问题与任一文档相关 → 必须 read_doc 读原文后以其内容为准作答，并注明"据知识库文档《标题》"；知识库内容优先于你的训练知识和网络搜索，两者冲突时以知识库为准（用户明确要求最新信息时除外）。列表中没有相关文档时才走常规流程（稳定知识直接答，需要实时信息再调用对应工具）。\n'
+    p += '【知识库文档列表】（共' + kbList.length + '篇'
+      + (shown.length < kbList.length ? '，按与本问题的相关性列出前' + shown.length + '篇，其余可 list_docs 查看' : '')
+      + '）\n'
+      + '回答问题前先核对此列表：问题与任一文档明显相关 → 必须 read_doc 读原文后以其内容为准作答，并注明"据知识库文档《标题》"；只是主题沾边、不确定是哪篇 → 用 search_docs 检索全文片段再定位；知识库内容优先于你的训练知识和网络搜索，两者冲突时以知识库为准（用户明确要求最新信息时除外）；多篇文档说法冲突时，取更新时间较新的那篇，并说明存在不同版本。列表中没有相关文档时才走常规流程（稳定知识直接答，需要实时信息再调用对应工具）。\n'
       + shown.join('\n') + '\n\n';
+  }
+  if (hasPrefetch) {
+    // 预检索片段放在文档列表之后、记忆之前：模型从上往下读，先看标题、再看正文，
+    // 最后才看用户长期记忆——「知识库优先于训练知识」这个顺序是刻意排的。
+    p += prefetchText + '\n\n';
   }
   if (memories.length) {
     const qTokens = memoryTokens(query);
@@ -90,7 +119,12 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
         + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n')
     + (hasKb
       ? '- 知识库优先：read_doc 读到的文档内容优先于通用知识和网络搜索结果，两者冲突时以知识库为准（用户明确要求最新信息时除外）；引用时注明"据知识库文档《标题》"。\n'
+        + '- 说"知识库里没有"之前必须先 search_docs 检索过一次；只看了标题列表就说没有，属于没查就下结论。\n'
+        + '- 同一问题引用多篇文档时逐篇注明出处，不要把两篇的说法混成一句。\n'
       : '- 知识库优先：read_doc 读到的文档内容优先于通用知识和训练记忆引用，引用时注明"据知识库文档《标题》"。\n')
+    + (hasPrefetch
+      ? '- 【知识库预检索结果】已经是一次真实检索的结果：它没提到的内容，不要凭印象补充成"知识库里说"；片段与你的训练知识冲突时以片段为准，并说明出处。\n'
+      : '')
     + '- 同一工具用相同参数反复调用没有意义：换关键词/换思路，仍无进展就基于已有信息直接回答。\n'
     + '- 工具返回以"失败 / 无结果 / 超时 / 未绑定"开头时，那就是失败，不要把失败文本改写成成功；换一次思路仍失败就停止调用，直接说明没查到什么。\n'
     + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。若收到"步数已用尽""时间预算已用尽""无法提供更多新信息"这类系统提示，立刻收束成最终答案，不要再规划下一步。';

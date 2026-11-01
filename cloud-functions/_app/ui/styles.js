@@ -727,6 +727,9 @@ export default `  <style>
     }
     .agent-toggle:hover { color: var(--text); border-color: var(--muted); }
     .agent-toggle.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    /* 开关放在右侧，用一组容器包住，避免 space-between 把它们拉开。
+       v7.8.0 起只剩 Agent 一个（知识库改为恒定开启，不再给开关）。 */
+    .toggle-group { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
     .disclaimer {
       max-width: 820px;
@@ -864,6 +867,22 @@ export default `  <style>
 
       .msg-actions { opacity: 1; }
       .delete-btn { opacity: 1; }
+
+      /* 窄屏：模型名 + Agent 开关挤一行，压缩内边距并给模型名让位 */
+      .input-bottom { gap: 6px; }
+      .toggle-group { gap: 4px; }
+      .input-bottom .agent-toggle { padding: 5px 9px; font-size: 12px; }
+      .model-display-text { max-width: 92px; }
+    }
+
+    /* 更窄的手机（≤360px）：Agent 开关只留图标。
+       实测 375px 视口下输入区可用宽约 317px，模型名 112 + 带文字的开关 ~100 还有富余；
+       但 320px 机型（iPhone SE 一代）只剩 ~260px，给模型名让位更稳。
+       知识库开关已在 v7.8.0 移除，这里只剩 Agent 一个按钮，无需再为两个按钮留空间。 */
+    @media (max-width: 360px) {
+      .input-bottom .agent-toggle .at-lbl { display: none; }
+      .input-bottom .agent-toggle .at-ico { font-size: 15px; line-height: 1; }
+      .input-bottom .agent-toggle { padding: 6px 10px; }
     }
   </style>
 `;

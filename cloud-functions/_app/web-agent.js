@@ -4,9 +4,11 @@ import { SSE_HEADERS } from './constants.js';
 import { tgAgentChat } from './agent/loop.js';
 import { agentLimits } from './agent/limits.js';
 
-// ==================== Web 端 Agent（v6.6.0，v6.9.3 只读权限分域） ====================
+// ==================== Web 端 Agent（v6.6.0，v6.9.3 只读权限分域，v7.7.0 预检索） ====================
 // 与 Telegram 共用 tgAgentChat（提供联网搜索、网页抓取、计算、天气、时间及知识库只读检索），
 // Web 端对知识库只读（kbReadOnly: true），不暴露写入工具，也不再读取/产生 Web 会话记忆。
+// v7.7.0：进入循环前先做一次知识库预检索（kbPrefetch），把最相关的正文片段直接放进
+// 系统提示词 —— 这是「Web 优先读知识库」真正落地的地方：不依赖模型主动调工具。
 // 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
 // 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
 async function handleWebAgent(env, body) {
@@ -47,6 +49,16 @@ async function handleWebAgent(env, body) {
         maxRuntimeMs: webBudgetMs,
         // Web 端查询优先知识库：文档列表注入系统提示词（loop.js 读取此标记）
         kbFirst: true,
+        // v7.7.0：进入循环前先做一次预检索，把最相关的正文片段直接放进提示词。
+        // 只给标题列表时，模型经常「看了标题就凭训练知识答」，或先花一步 search_docs
+        // 才摸到正文；预检索把这一步省掉，也让回答真正以知识库为准。
+        // v7.8.0：页面上的开关已移除，知识库恒定开启。kb_first=false 只为外部调用与
+        // 旧缓存页面保留；运维级关闭用 WEB_KB_FIRST=0。
+        kbPrefetch: body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0',
+        kbPrefetchBudgetMs: (() => {
+          const v = parseInt(env.WEB_KB_PREFETCH_MS || '', 10);
+          return v > 0 ? Math.min(v, 6000) : 2500;
+        })(),
         // v6.9.3：Web 端对知识库只读——写入（remember / save_doc / delete_doc）
         // 仅 Telegram 端开放，Web 访客无法污染全局知识库
         kbReadOnly: true,

@@ -1951,18 +1951,18 @@ async function main() {
     }
   });
 
-  console.log('\n=== 13. Agent 性能加速与 19 项零密钥工具自检 ===');
+  console.log('\n=== 13. Agent 性能加速与 20 项零密钥工具自检 ===');
 
   const agentToolsMod = await import('../cloud-functions/_app/agent/tools.js');
   const toolsLocalMod = await import('../cloud-functions/_app/agent/tools-local.js');
   const toolsWebMod = await import('../cloud-functions/_app/agent/tools-web.js');
   const limitsMod = await import('../cloud-functions/_app/agent/limits.js');
 
-  await checkAsync('Agent 工具箱共注册 19 项工具（Web 只读模式自动过滤 4 项写入工具剩 15 项）', () => {
+  await checkAsync('Agent 工具箱共注册 20 项工具（Web 只读模式自动过滤 4 项写入工具剩 16 项）', () => {
     const allTools = agentToolsMod.getAgentTools(false);
     const roTools = agentToolsMod.getAgentTools(true);
-    assert.equal(allTools.length, 19);
-    assert.equal(roTools.length, 15);
+    assert.equal(allTools.length, 20);
+    assert.equal(roTools.length, 16);
     const names = allTools.map(t => t.function.name);
     for (const expected of ['unit_convert', 'text_toolkit', 'network_lookup', 'github_lookup', 'arxiv_search', 'trending_news']) {
       assert.ok(names.includes(expected), '应包含新工具 ' + expected);
@@ -2560,6 +2560,349 @@ async function main() {
     assert.equal(typeof j.debug.agent.avgSteps, 'number');
     assert.ok(j.debug.agent.cache && typeof j.debug.agent.cache.hits === 'number');
     assert.equal(/sk-|Bearer /.test(JSON.stringify(j.debug.agent)), false, '统计里不得出现密钥原文');
+  });
+
+  console.log('\n=== 16. 知识库读取链路（全库检索 / 章节跳读 / 多候选 / 单字噪音） ===');
+
+  const kbRegMod = await import('../cloud-functions/_app/kb/registry.js');
+  const kbEnv = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+
+  // 造 45 篇普通文档，把唯一关键词埋在第 40 篇的「正文」里（标题里不含它）。
+  // 旧实现 reg.slice(0, 30) 只扫前 30 篇，这一篇永远检索不到，而且界面上看不出来。
+  for (let i = 1; i <= 45; i++) {
+    const isTarget = i === 40;
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', {
+      title: isTarget ? '技术笔记 40' : '技术笔记 ' + String(i).padStart(2, '0'),
+      content: isTarget
+        ? '玄武岩纤维是一种无机纤维，耐高温、耐腐蚀，常用于复合筋材。'.repeat(10)
+        : '这是第 ' + i + ' 篇的正文，讲的是常规内容，没有任何稀有名词。'.repeat(6),
+    });
+  }
+
+  await checkAsync('中文检索分词不再产出单字 token（"的/不/在" 不再制造假命中）', () => {
+    const tk = docTools.docSearchTokens('玄武岩纤维');
+    assert.equal(tk.some(t => t.length === 1), false, '两字以上的中文查询不该拆出单字');
+    assert.ok(tk.includes('玄武岩纤维'));
+    assert.ok(tk.includes('玄武'));
+    // 整串就是单字时才保留单字，否则「查一个汉字」会失效
+    assert.deepEqual(docTools.docSearchTokens('库'), ['库']);
+    // 停用字混在长查询里，不应作为独立 token 进入打分
+    assert.equal(docTools.docSearchTokens('知识库的使用说明').includes('的'), false);
+  });
+
+  await checkAsync('全文检索扫全库：第 40 篇正文里的关键词能命中（旧实现只扫前 30 篇）', async () => {
+    const r = await docTools.kbSearchDocs(kbEnv, '玄武岩纤维', { topN: 3 });
+    assert.equal(r.ok, true);
+    assert.ok(r.total >= 45, '注册表应有 45 篇以上，实际 ' + r.total);
+    assert.equal(r.scanned, r.total, '小知识库应扫完全部（' + r.scanned + '/' + r.total + '）');
+    assert.equal(r.truncated, false);
+    assert.equal(r.hits.length, 1, '只有第 40 篇含该词');
+    assert.equal(r.hits[0].title, '技术笔记 40');
+    assert.ok(r.hits[0].bestOffset > 0);
+  });
+
+  await checkAsync('检索结果如实回报扫描范围，不说"知识库里没有"却只扫了一部分', async () => {
+    const r = await docTools.kbSearchDocs(kbEnv, '根本不存在的词组', { topN: 3 });
+    assert.equal(r.ok, true);
+    assert.equal(r.hits.length, 0);
+    assert.equal(r.scanned, r.total);
+    const msg = await docTools.toolSearchDocs(kbEnv, { query: '根本不存在的词组' });
+    assert.match(msg, /知识库中未找到与「根本不存在的词组」相关的内容/);
+    assert.match(msg, new RegExp('已扫描 ' + r.scanned + '/' + r.total + ' 篇'));
+    assert.match(msg, /list_docs/);
+  });
+
+  await checkAsync('search_docs 已注册进工具表，且与 read_doc 回落分支共用同一套打分', async () => {
+    const names = agentToolsMod.getAgentTools(false).map(t => t.function.name);
+    assert.ok(names.includes('search_docs'), '工具表应包含 search_docs');
+    assert.ok(names.includes('read_doc') && names.includes('list_docs'));
+    const viaTool = await agentToolsMod.execAgentTool('search_docs', { query: '玄武岩纤维' }, kbEnv, 'web_kb', false);
+    assert.match(viaTool, /【命中 1：知识库文档《技术笔记 40》/);
+    assert.match(viaTool, /offset=/);
+    assert.match(viaTool, /read_doc/);
+    const empty = await agentToolsMod.execAgentTool('search_docs', { query: '' }, kbEnv, 'web_kb', false);
+    assert.match(empty, /关键词为空/);
+  });
+
+  await checkAsync('kbBestWindow 贴着真实命中取窗口（不再按固定步长切网格）', () => {
+    const filler = '无关内容'.repeat(300); // 1200 字符
+    const text = filler + '目标关键词 目标关键词 目标关键词' + filler;
+    const win = docTools.kbBestWindow(text, ['目标关键词'], 1200);
+    assert.ok(win, '有命中就应返回窗口');
+    assert.equal(win.anchor, filler.length, '窗口锚点应落在首个命中处');
+    assert.equal(win.score, 45, '3 次命中 × 词长 5 × 权重 3');
+    assert.equal(docTools.kbBestWindow('完全无关的正文', ['目标关键词'], 1200), null);
+  });
+
+  await checkAsync('kbBuildToc 抽 h1~h4 标题并给出可跳读的绝对 offset', () => {
+    const text = '# 一级标题\n\n正文\n\n## 二级标题\n\n更多正文\n\n#### 四级标题\n';
+    const toc = docTools.kbBuildToc(text, 12);
+    assert.equal(toc.length, 3);
+    assert.equal(toc[0].level, 1);
+    assert.equal(toc[0].offset, 0);
+    assert.equal(toc[1].title, '二级标题');
+    assert.equal(toc[1].offset, text.indexOf('## 二级标题'));
+    assert.equal(toc[2].level, 4);
+    assert.equal(docTools.kbBuildToc('没有任何小标题的正文', 12).length, 0);
+  });
+
+  await checkAsync('read_doc 首次读长文档附【章节目录】，按目录 offset 跳读不再回放目录', async () => {
+    const body = '# 第一节 概述\n\n' + 'A'.repeat(3000)
+      + '\n\n## 1.1 细节\n\n' + 'B'.repeat(3000)
+      + '\n\n## 1.2 结论\n\n' + 'C'.repeat(3000);
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: '长文档测试', content: body });
+
+    const first = await docTools.toolReadDoc(kbEnv, { query: '长文档测试' });
+    assert.match(first, /【章节目录】/);
+    assert.match(first, /1\.1 细节（offset=\d+）/);
+    assert.match(first, /1\.2 结论（offset=\d+）/);
+    assert.match(first, /可传 offset 顺序阅读|可直接传对应 offset 跳到该节/);
+
+    const off = parseInt(first.match(/1\.1 细节（offset=(\d+)）/)[1], 10);
+    assert.ok(off > 3000, '第二节 offset 应越过第一节正文，实际 ' + off);
+    const second = await docTools.toolReadDoc(kbEnv, { query: '长文档测试', offset: off });
+    assert.equal(/【章节目录】/.test(second), false, '翻页时不该再回放目录');
+    assert.match(second, /B{50}/, '跳读应落在 1.1 节正文');
+    assert.match(second, /已读到文档末尾|offset=/);
+  });
+
+  await checkAsync('标题模糊命中多篇时给出「另有 N 篇标题相近」提示（不静默读错）', async () => {
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: 'ARM 架构', content: 'ARM 是精简指令集架构，主打低功耗。'.repeat(20) });
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: '甲骨文 ARM 放货', content: '甲骨文云 ARM 实例放货时间与抢购经验。'.repeat(20) });
+
+    const reg = await kbRegMod.kbGetRegistry(kbEnv);
+    const cand = kbRegMod.kbFindRegCandidates(reg, 'ARM');
+    assert.equal(cand.length, 2, '两篇标题都含 ARM，应都作为候选');
+    assert.equal(cand[0].title, 'ARM 架构', '同等可信度时按注册表顺序取第一篇');
+    // 精确标题必须排在最前，不被"包含"候选抢走
+    assert.equal(kbRegMod.kbFindRegCandidates(reg, '甲骨文 ARM 放货')[0].title, '甲骨文 ARM 放货');
+
+    const msg = await docTools.toolReadDoc(kbEnv, { query: 'ARM' });
+    assert.match(msg, /【知识库文档《ARM 架构》】/);
+    assert.match(msg, /另有 1 篇标题相近的文档：《甲骨文 ARM 放货》/);
+  });
+
+  await checkAsync('list_docs 按更新时间倒序、带体积与日期，超 40 篇截断并指向 search_docs', async () => {
+    // 时间戳是毫秒级，同毫秒内保存的两篇排序不可判定，这里故意错开 5ms 造出"最新"
+    await new Promise(r => setTimeout(r, 5));
+    await docTools.toolSaveDoc(kbEnv, 'web_kb', { title: '最新入库的文档', content: '用来验证列表按更新时间倒序。' });
+    const msg = await docTools.toolListDocs(kbEnv);
+    assert.match(msg, /共\d+篇，按更新时间倒序，显示前 40 篇/);
+    assert.match(msg, /技术笔记 40（\d+ KB，\d{4}-\d{2}-\d{2}）/);
+    assert.match(msg, /用 search_docs 按关键词检索全文/);
+    assert.match(msg.split('\n')[1], /^1\. 最新入库的文档/, '最新保存的应排最前');
+  });
+
+  await checkAsync('search_docs 的结果上限单独放宽到 6000（3 段片段 + 续读提示不会被砍掉）', () => {
+    assert.equal(limitsMod.toolResultMax({}, 'search_docs'), 6000);
+    // 显式配置仍然整体覆盖
+    assert.equal(limitsMod.toolResultMax({ AGENT_TOOL_RESULT_MAX: '2000' }, 'search_docs'), 2000);
+    assert.equal(limitsMod.toolResultMax({}, 'read_doc'), 8500);
+  });
+
+  await checkAsync('delete_doc 命中多篇时明确告知只删了哪一篇（删除不可逆，不顺手删）', async () => {
+    const msg = await docTools.toolDeleteDoc(kbEnv, { query: 'ARM' });
+    assert.match(msg, /已删除知识库文档《ARM 架构》/);
+    assert.match(msg, /另有 1 篇标题相近的文档未删除：《甲骨文 ARM 放货》/);
+    const reg = await kbRegMod.kbGetRegistry(kbEnv);
+    assert.equal(reg.some(e => e.title === '甲骨文 ARM 放货'), true, '相近标题的文档不能被顺手删掉');
+    assert.equal(reg.some(e => e.title === 'ARM 架构'), false);
+  });
+
+  console.log('\n=== 17. Web 优先读知识库（预检索 / 双模式注入 / 前端开关） ===');
+
+  const prefetchMod = await import('../cloud-functions/_app/kb/prefetch.js');
+  const promptMod = await import('../cloud-functions/_app/agent/prompt.js');
+  // uiMod 在第 10 节已导入，这里直接复用（同一模块实例）
+
+  const webKbEnv = {
+    R2: blobBackend.makeBlobBackend(fakeBlobStore()),
+    API_URL_1: 'https://up.example/v1/chat/completions',
+    MODEL_1: 'm1:测试模型',
+    API_KEY_1: 'k1',
+  };
+  await docTools.toolSaveDoc(webKbEnv, 'web_prefetch', {
+    title: '甲骨文云 ARM 免费额度',
+    content: '# 免费额度\n\n甲骨文云 ARM 实例每月提供 4 核 24G 的永久免费额度，需要信用卡验证。\n\n## 抢购技巧\n\n凌晨放货概率更高。',
+  });
+
+  await checkAsync('预检索跳过规则：闲聊 / 过短 / 空问题都不去扫库（省下 1~2 秒）', () => {
+    assert.equal(prefetchMod.kbPrefetchGate('你好').reason, 'chitchat');
+    assert.equal(prefetchMod.kbPrefetchGate('谢谢！').reason, 'chitchat');
+    assert.equal(prefetchMod.kbPrefetchGate('嗯').reason, 'chitchat');
+    assert.equal(prefetchMod.kbPrefetchGate('a').reason, 'too_short');
+    assert.equal(prefetchMod.kbPrefetchGate('   ').reason, 'empty');
+    assert.equal(prefetchMod.kbPrefetchGate('甲骨文云免费额度').ok, true);
+  });
+
+  await checkAsync('预检索命中：片段带文档标题、剥掉 frontmatter、明确要求注明出处', async () => {
+    prefetchMod.clearKbPrefetchCache();
+    const r = await prefetchMod.kbPrefetch(webKbEnv, '甲骨文云 ARM 免费额度怎么申请', { topN: 2 });
+    assert.equal(r.ok, true);
+    assert.match(r.text, /【知识库预检索结果】/);
+    assert.match(r.text, /《甲骨文云 ARM 免费额度》/);
+    assert.match(r.text, /4 核 24G/);
+    assert.equal(/title:/.test(r.text), false, '片段里不该出现 frontmatter');
+    assert.match(r.text, /不要用相同关键词重复 search_docs/);
+    assert.equal(r.scanned, r.total, '小知识库应扫完全部');
+  });
+
+  await checkAsync('同一问题第二次预检索走缓存（前端断流重试不再扫库）', async () => {
+    const q = '甲骨文云 ARM 免费额度怎么申请';
+    const r1 = await prefetchMod.kbPrefetch(webKbEnv, q);
+    const r2 = await prefetchMod.kbPrefetch(webKbEnv, q);
+    assert.equal(r2.cached, true);
+    assert.equal(r2.text, r1.text);
+  });
+
+  await checkAsync('预检索无命中时如实返回 no_hit，不编造片段', async () => {
+    const r = await prefetchMod.kbPrefetch(webKbEnv, '量子色动力学的渐近自由', { topN: 2 });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'no_hit');
+    assert.equal(r.text, '');
+  });
+
+  await checkAsync('系统提示词：有预检索时注入片段并改写作答顺序，没有时不出现该段', () => {
+    const withPre = promptMod.buildAgentSystemPrompt(
+      [], '甲骨文云额度', [{ title: '甲骨文云 ARM 免费额度', file: 'a.md' }], true,
+      '【知识库预检索结果】片段正文'
+    );
+    assert.match(withPre, /【知识库预检索结果】片段正文/);
+    assert.match(withPre, /先读完它/);
+    assert.match(withPre, /不要凭印象补充成/);
+
+    const noPre = promptMod.buildAgentSystemPrompt(
+      [], '甲骨文云额度', [{ title: '甲骨文云 ARM 免费额度', file: 'a.md' }], true, ''
+    );
+    assert.equal(/【知识库预检索结果】/.test(noPre), false);
+    assert.match(noPre, /意图判断：纯闲聊/);
+  });
+
+  // 普通对话模式（前端关掉 Agent）：这是旧实现最大的漏洞——知识库等于不存在
+  async function postChat(body, env) {
+    let captured = null;
+    const prev = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      captured = JSON.parse(init.body);
+      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+    try {
+      const res = await mod.routeRequest(new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }), env, { waitUntil: () => {} });
+      assert.equal(res.status, 200);
+      return captured;
+    } finally {
+      globalThis.fetch = prev;
+    }
+  }
+
+  await checkAsync('普通对话模式（Agent 关闭）也会把知识库片段注入上游请求', async () => {
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
+      model: 'm1', agent: false,
+    }, webKbEnv);
+    assert.ok(captured, '应该真的发出了上游请求');
+    assert.equal(captured.messages[0].role, 'system');
+    assert.match(String(captured.messages[0].content), /【知识库预检索结果】/);
+    assert.match(String(captured.messages[0].content), /4 核 24G/);
+    assert.equal(captured.messages[1].role, 'user', '用户消息不能被顶掉');
+    assert.equal(captured.messages.length, 2);
+  });
+
+  await checkAsync('外部调用显式传 kb_first=false 时不做预检索（页面已无开关，保留逃生口）', async () => {
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
+      model: 'm1', agent: false, kb_first: false,
+    }, webKbEnv);
+    assert.equal(/【知识库预检索结果】/.test(JSON.stringify(captured.messages)), false);
+    assert.equal(captured.messages.length, 1);
+  });
+
+  await checkAsync('闲聊不触发预检索（"你好"不会带出一堆无关文档）', async () => {
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      model: 'm1', agent: false,
+    }, webKbEnv);
+    assert.equal(/【知识库预检索结果】/.test(JSON.stringify(captured.messages)), false);
+  });
+
+  await checkAsync('Agent 模式：预检索片段进系统提示词，并推送「正在优先检索知识库」进度', async () => {
+    const prev = globalThis.fetch;
+    let sysContent = '';
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (body.messages && body.messages[0] && body.messages[0].role === 'system') {
+        sysContent = String(body.messages[0].content);
+      }
+      return sseFromEvents([deltaEvent({ content: '据知识库文档《甲骨文云 ARM 免费额度》，每月 4 核 24G。' })]);
+    };
+    const progresses = [];
+    try {
+      const r = await loopMod.tgAgentChat(
+        Object.assign({}, webKbEnv, { AGENT_MAX_STEPS: '2' }),
+        () => Promise.resolve({ ok: true }),
+        'web_prefetch_agent', 'm1',
+        [{ role: 'user', content: '甲骨文云 ARM 免费额度怎么申请' }],
+        true,
+        (t) => { progresses.push(t); return Promise.resolve(); },
+        { kbReadOnly: true, kbFirst: true, kbPrefetch: true, maxRuntimeMs: 30000 }
+      );
+      assert.match(sysContent, /【知识库预检索结果】/);
+      assert.match(sysContent, /4 核 24G/);
+      assert.equal(progresses.some(p => /正在优先检索知识库/.test(p)), true, '应推送预检索进度');
+      assert.match(r.text, /4 核 24G/);
+    } finally {
+      globalThis.fetch = prev;
+    }
+  });
+
+  await checkAsync('Web 页面：知识库恒定开启，不再有「📚 知识库」开关', () => {
+    const html = uiMod.HTML_CONTENT;
+    // 开关整体移除：按钮、偏好读写、请求字段都不该再出现，
+    // 任何一处残留都会让「默认开启」变成「看浏览器里存过什么」。
+    assert.equal(/id="kbToggle"/.test(html), false, '不应再有知识库开关按钮');
+    assert.equal(/kbFirst/.test(html), false, '不应再有前端开关状态变量');
+    assert.equal(/kb_first:/.test(html), false, '请求体不应再带开关字段（服务端默认即开启）');
+    assert.equal(/getItem\('eochat_kb_first'\)/.test(html), false, '不应再读取历史偏好');
+    // 但要把老用户浏览器里的「关闭状态」清掉，否则升级后仍在静默关库
+    assert.match(html, /localStorage\.removeItem\('eochat_kb_first'\)/);
+
+    // Agent 开关仍在，文案明确「开关与否都优先读知识库」
+    assert.match(html, /id="agentToggle"/);
+    assert.match(html, /无论开关与否，回答都会优先检索知识库文档/);
+    // 文案拆成 图标 + 文字 两个 span：窄屏隐藏 .at-lbl 只留图标
+    assert.match(html, /id="agentToggle"[\s\S]{0,260}?<span class="at-ico">🤖<\/span><span class="at-lbl">Agent<\/span>/);
+    assert.match(html, /querySelector\('\.at-lbl'\)/, '渲染函数要改 .at-lbl，不能整块覆盖 textContent');
+    assert.match(html, /@media \(max-width: 360px\)[\s\S]{0,200}\.at-lbl \{ display: none; \}/);
+    // 知识库开关的专属样式也应一并清掉（否则 CSS 里留着一个永远匹配不到的 .kb-on）
+    assert.equal(/\.kb-on/.test(html), false);
+  });
+
+  await checkAsync('知识库只读检索进 L1 缓存，save_doc 后立即失效（不会「刚存就查不到」）', async () => {
+    const env = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+    agentToolsMod.clearAgentToolCache();
+    await agentToolsMod.execAgentTool('save_doc',
+      { title: '缓存验证文档', content: '这里包含缓存验证关键词，用于测试命中。' }, env, 'tg_cache', false);
+
+    const q = { query: '缓存验证关键词' };
+    const r1 = await agentToolsMod.execAgentTool('search_docs', q, env, 'web_cache', false);
+    assert.match(r1, /缓存验证文档/);
+    const hits1 = agentToolsMod.getAgentToolCacheStats().hits;
+    const r2 = await agentToolsMod.execAgentTool('search_docs', q, env, 'web_cache', false);
+    const hits2 = agentToolsMod.getAgentToolCacheStats().hits;
+    assert.equal(r2, r1, '同参重复检索应返回同一份结果');
+    assert.ok(hits2 > hits1, '第二次同参调用应命中 L1 缓存');
+
+    // 写入新文档必须立刻让检索缓存失效，否则用户会以为「存了但搜不到」
+    await agentToolsMod.execAgentTool('save_doc',
+      { title: '第二篇缓存文档', content: '同样提到缓存验证关键词，但内容不同。' }, env, 'tg_cache', false);
+    const r3 = await agentToolsMod.execAgentTool('search_docs', q, env, 'web_cache', false);
+    assert.match(r3, /第二篇缓存文档/, '保存后必须立刻能搜到新文档');
   });
 
   console.log('\n=== 结果 ===');

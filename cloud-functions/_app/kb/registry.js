@@ -126,18 +126,37 @@ async function kbSaveRegistry(env, reg) {
     return false;
   }
 }
-// 注册表内模糊查找：标题精确相等 > 标题包含 > 文件名包含（大小写不敏感）
-function kbFindRegEntry(reg, query) {
+// 注册表内模糊查找：标题精确相等 > 标题包含 > slug 归一化包含 > 文件名包含（大小写不敏感）
+// v7.6.0：改为先返回「全部候选（按可信度排序）」，再由调用方决定取第一个还是让模型挑。
+// 原因：知识库里《ARM 架构》与《甲骨文 ARM 放货》同时存在时，query="ARM" 只取第一个
+// 会静默读错文档 —— 对知识库来说，「读错一篇」比「没读到」更糟。
+function kbFindRegCandidates(reg, query) {
   const q = String(query || '').trim().toLowerCase();
-  if (!q || !reg || !reg.length) return null;
-  // v6.8.4：查询也做 slug 归一化（去空格/特殊字符），"甲骨文云 ARM" 能命中 "甲骨文云ARM"
+  if (!q || !reg || !reg.length) return [];
   let qSlug = '';
   try { qSlug = kbDocSlug(query).toLowerCase(); } catch (e) {}
-  return reg.find(e => String(e.title || '').toLowerCase() === q)
-    || reg.find(e => String(e.title || '').toLowerCase().indexOf(q) !== -1)
-    || (qSlug && reg.find(e => { try { return kbDocSlug(e.title || e.file).toLowerCase().indexOf(qSlug) !== -1; } catch (ee) { return false; } }))
-    || reg.find(e => String(e.file || '').toLowerCase().indexOf(q) !== -1)
-    || null;
+  const exact = [];
+  const contains = [];
+  const slug = [];
+  const fileHit = [];
+  for (const e of reg) {
+    const t = String(e.title || '').toLowerCase();
+    if (t === q) { exact.push(e); continue; }
+    if (t.indexOf(q) !== -1) { contains.push(e); continue; }
+    if (qSlug) {
+      let s = '';
+      try { s = kbDocSlug(e.title || e.file).toLowerCase(); } catch (ee) { s = ''; }
+      if (s && s.indexOf(qSlug) !== -1) { slug.push(e); continue; }
+    }
+    if (String(e.file || '').toLowerCase().indexOf(q) !== -1) fileHit.push(e);
+  }
+  return exact.concat(contains, slug, fileHit);
+}
+
+// 只要最优候选时的便捷写法（保持旧行为）
+function kbFindRegEntry(reg, query) {
+  const c = kbFindRegCandidates(reg, query);
+  return c.length ? c[0] : null;
 }
 function kbFmtSize(b) {
   b = b || 0;
@@ -158,6 +177,7 @@ export {
   kbRebuildRegistry,
   kbGetRegistry,
   kbSaveRegistry,
+  kbFindRegCandidates,
   kbFindRegEntry,
   kbFmtSize,
   kbFmtDate,

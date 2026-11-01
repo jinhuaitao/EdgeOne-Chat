@@ -165,7 +165,7 @@ export default `</head>
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
         <h2>今天我能为你提供什么帮助？</h2>
-        <p>输入问题即可开始，支持 Markdown、代码高亮、19 项 Agent 工具、Telegram 与微信 ClawBot 通道。</p>
+        <p>输入问题即可开始，支持 Markdown、代码高亮、20 项 Agent 工具、Telegram 与微信 ClawBot 通道。<br>回答会自动先检索你的知识库文档（无需开关）。</p>
         <div class="suggestion-grid" id="suggestionGrid">
           <button class="suggestion-chip" type="button" data-prompt="帮我写一封得体的商务邮件">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
@@ -208,7 +208,9 @@ export default `</head>
               {{MODEL_OPTIONS}}
             </select>
           </div>
-          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人">🤖 Agent</button>
+          <div class="toggle-group">
+            <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间）。无论开关与否，回答都会优先检索知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人"><span class="at-ico">🤖</span><span class="at-lbl">Agent</span></button>
+          </div>
         </div>
       </div>
       <div class="disclaimer">AI 生成的内容可能不准确，请核实重要信息。</div>

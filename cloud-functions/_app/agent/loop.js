@@ -24,6 +24,7 @@ import { getAgentTools, execAgentTool, getAgentToolCacheStats } from './tools.js
 import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
+import { kbPrefetch } from '../kb/prefetch.js';
 
 // 同一工具 + 同一参数，本轮累计调用到第 3 次就不再执行（结果必然一样），第 4 次直接收尾
 const REPEAT_SKIP_AT = 3;
@@ -181,16 +182,37 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
   const kbReadOnly = !!(opts && opts.kbReadOnly);
   const shouldLoadKb = !!(allowTools || (opts && opts.kbFirst));
+  // deadline 必须在预检索之前算：预检索本身也要花时间（默认上限 2.5 秒），
+  // 算在 deadline 之后等于「预算外白送 2.5 秒」，Web 端的 90 秒承诺就会变成 92.5 秒。
+  const deadline = tgAgentDeadline(env, opts);
   const [memories, kbDocs] = await Promise.all([
     kbReadOnly ? Promise.resolve([]) : agentGetMemories(env, chatId),
     shouldLoadKb ? kbGetRegistry(env).catch(() => null) : Promise.resolve(null),
   ]);
-  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
+  // v7.7.0：预检索。只注入标题列表时，模型仍可能「看了标题就凭训练知识作答」，
+  // 或者先花一步 search_docs 才摸到正文。这里在进入循环前直接把最相关的 2 段正文
+  // 取出来放进提示词，Web 端（含关闭 Agent 的普通对话）都能第一时间用上知识库。
+  // 预检索自带预算与跳过规则，失败一律静默降级（不影响正常回答）。
+  let kbPrefetchText = '';
+  if (shouldLoadKb && opts && opts.kbPrefetch) {
+    // 预检索也受总预算约束：剩余时间不足 4 秒就干脆不查，把时间留给作答与收尾。
+    const reserveMs = agentLimits(env).wrapupReserveMs || 12000;
+    const remainMs = deadline - Date.now() - reserveMs;
+    if (remainMs > 4000) {
+      if (onProgress) { try { await onProgress('📚 正在优先检索知识库…'); } catch (e) {} }
+      const wantBudget = opts.kbPrefetchBudgetMs > 0 ? opts.kbPrefetchBudgetMs : 2500;
+      const pre = await kbPrefetch(env, query, {
+        budgetMs: Math.min(wantBudget, remainMs),
+        topN: opts.kbPrefetchTopN,
+      }).catch(() => null);
+      if (pre && pre.ok) kbPrefetchText = pre.text;
+    }
+  }
+  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText);
   const tools = allowTools ? getAgentTools(kbReadOnly) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });
 
-  const deadline = tgAgentDeadline(env, opts);
   const origUserText = (opts && opts.origUserText) !== undefined ? opts.origUserText : query;
   const stats = newTurnStats();
   const r = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,

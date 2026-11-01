@@ -27,6 +27,24 @@ import { getPwaVersion } from './pwa/version.js';
 import { HTML_CONTENT } from './ui/index.js';
 import { resolveStore, ensureProvisioned, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
+import { kbPrefetch } from './kb/prefetch.js';
+
+// 取最后一条用户消息的纯文本（兼容多模态分片数组）。预检索用它当查询词。
+function pickLastUserText(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== 'user') continue;
+    const c = m.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) {
+      const seg = c.find(s => s && s.type === 'text' && typeof s.text === 'string');
+      return seg ? seg.text : '';
+    }
+    return '';
+  }
+  return '';
+}
 
 // 把 EdgeOne 的 context.env 包一层，在保留原有全部环境变量的同时，
 // 额外提供 env.R2（存储替身）。用 Proxy 而不是对象展开，是为了不丢失
@@ -151,6 +169,36 @@ async function routeRequest(request, env, ctx) {
         // 进度通过 SSE 事件推送。Web 端对知识库只读（kbReadOnly: true），优先检索知识库文档。
         if (body.agent === true && !isImageAPI) {
           return await handleWebAgent(env, body);
+        }
+
+        // v7.7.0：普通对话模式也优先读知识库。
+        // 旧实现只有 Agent 模式才加载知识库 —— 用户一关 Agent，知识库就等于不存在，
+        // 回答完全靠模型训练知识。这里在调用上游之前先做一次轻量全文检索，
+        // 命中就把片段作为一条 system 消息插到最前面（前端历史里不保存它，不会累积）。
+        // v7.8.0：页面上不再有「📚 知识库」开关，知识库恒定开启（这正是用户要的默认行为）。
+        // 保留 kb_first=false 只是给外部调用方/旧缓存页面留的逃生口，页面本身已不再发送；
+        // 运维级关闭用 WEB_KB_FIRST=0。
+        if (!isImageAPI && body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0') {
+          try {
+            const lastUserText = pickLastUserText(body.messages);
+            const pre = await kbPrefetch(env, lastUserText, {
+              budgetMs: parseInt(env.WEB_KB_PREFETCH_MS || '', 10) > 0
+                ? Math.min(parseInt(env.WEB_KB_PREFETCH_MS, 10), 6000)
+                : 2200,
+              topN: 2,
+            });
+            if (pre && pre.ok && pre.text) {
+              const first = payload.messages[0];
+              if (first && first.role === 'system') {
+                // 前端自带 system 时合并，避免出现两条 system（部分上游会整单 400）
+                payload.messages[0] = { role: 'system', content: String(first.content || '') + '\n\n' + pre.text };
+              } else {
+                payload.messages = [{ role: 'system', content: pre.text }].concat(payload.messages);
+              }
+            }
+          } catch (e) {
+            // 预检索失败绝不能影响正常对话：静默降级为「不带知识库回答」
+          }
         }
 
         const { resp: upstreamResponse } = await fetchWithKeyRotation(aiConfig, (key) => ({
