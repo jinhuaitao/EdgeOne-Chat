@@ -685,7 +685,8 @@ export async function handleTgWebhook(request, env) {
                 await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
               } catch (e) {}
             };
-            const runAgentTurn = (allowTools) => {
+            const runAgentTurn = (allowTools, extraOpts) => {
+              const opts = extraOpts ? Object.assign({}, agentOpts, extraOpts) : agentOpts;
               if (resumeState) {
                 return tgAgentResume(env, tgApi, chatId, {
                   targetModelId: resumeState.targetModelId || targetModelId,
@@ -693,13 +694,16 @@ export async function handleTgWebhook(request, env) {
                   messages: resumeState.messages,
                   loopStartIdx: resumeState.loopStartIdx,
                   origUserText: resumeState.origUserText || ''
-                }, onProgress, agentOpts);
+                }, onProgress, opts);
               }
-              return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, agentOpts);
+              return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts);
             };
             let r;
             try {
               r = await runAgentTurn(true);
+              // v7.9.0：通道拒收 tools 时先降级为「文本调用模式」（工具仍可执行），
+              // 仍不行才彻底关工具。旧实现一步跳到无工具，用户拿到残废答案且毫不知情。
+              if (r.fallback) r = await runAgentTurn(true, { promptTools: true });
               if (r.fallback) r = await runAgentTurn(false);
             } catch (e) {
               r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };

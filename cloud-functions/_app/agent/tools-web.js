@@ -152,35 +152,50 @@ async function toolWebSearch(query, count) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const endpoints = [
-      'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),
-      'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query)
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+    const hasCjk = /[\u4e00-\u9fff]/.test(query);
+    // v7.9.0：不再只有 DuckDuckGo。DDG 的 html 端对部分出口 IP 返回 202 验证页，
+    // 旧实现把验证页解析成「无结果」，中文长尾词尤其容易全空，而模型会据此回答
+    // 「没查到」——它其实根本没搜成。现在按顺序回退，并把「被限流」和「真没结果」分开报。
+    const engines = [
+      { name: 'duckduckgo', url: 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query), parse: parseDuckDuckGo },
+      { name: 'duckduckgo-lite', url: 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query), parse: parseDuckDuckGoLite },
     ];
+    // 百度只对含中文的查询回退：英文查询它的结果质量不如 DDG，还多一次网络往返
+    if (hasCjk) {
+      engines.push({ name: 'baidu', url: 'https://www.baidu.com/s?ie=utf-8&wd=' + encodeURIComponent(query), parse: parseBaidu });
+    }
+
     let out = [];
-    let lastStatus = 0;
-    for (const endpoint of endpoints) {
-      if (ctrl.signal.aborted) break;
+    let blocked = 0;
+    let failed = 0;
+    for (const engine of engines) {
+      if (ctrl.signal.aborted) return '搜索失败: 超时';
       let res;
       try {
-        res = await fetch(endpoint, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+        res = await fetch(engine.url, {
+          headers: { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
           signal: ctrl.signal
         });
       } catch (e) {
         if (e && e.name === 'AbortError') return '搜索失败: 超时';
+        failed += 1;
         continue;
       }
-      lastStatus = res.status;
-      if (!res.ok) { try { if (res.body) await res.body.cancel(); } catch (e) {} continue; }
+      if (!res.ok) { try { if (res.body) await res.body.cancel(); } catch (e) {} failed += 1; continue; }
       let html = '';
-      try { html = await readBodyBudget(res, 300000); }
-      catch (e) { continue; }
-      out = endpoint.indexOf('/lite/') !== -1 ? parseDuckDuckGoLite(html, count) : parseDuckDuckGo(html, count);
-      if (!out.length && endpoint.indexOf('/lite/') === -1) out = parseDuckDuckGoLite(html, count);
+      try { html = await readBodyBudget(res, 300000); } catch (e) { failed += 1; continue; }
+      if (looksBlocked(html, res.status)) { blocked += 1; continue; }
+      out = engine.parse(html, count);
       if (out.length) break;
     }
-    if (!out.length && lastStatus && lastStatus !== 200) return '搜索请求失败，HTTP ' + lastStatus;
-    if (!out.length) return '搜索「' + query + '」无结果';
+    if (!out.length) {
+      if (blocked > 0) {
+        return '搜索被上游限流（返回了人机验证页），本次没有拿到结果。请稍后重试，或改用 wiki_lookup / 直接 web_fetch 已知网址；不要据此断定该主题没有资料。';
+      }
+      if (failed > 0) return '搜索请求失败（网络或 HTTP 错误），请稍后重试';
+      return '搜索「' + query + '」无结果';
+    }
     let text = '搜索「' + query + '」结果：\n';
     out.forEach((r, i) => { text += (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snip ? '\n   摘要：' + r.snip : '') + '\n'; });
     return text.slice(0, 4000);
@@ -286,6 +301,48 @@ function parseDuckDuckGoLite(html, count) {
     out.push({ title, url, snip: sn ? clean(sn[1]).slice(0, 200) : '' });
   }
   return out;
+}
+
+// v7.9.0：百度结果解析（中文查询的回退引擎）。
+// 百度把真实地址放在结果容器的 mu 属性里，标题在 h3 内；摘要的 class 名带哈希、
+// 版本间会变，取不到就留空 —— 有标题和 URL 已经足够让模型判断该读哪一篇。
+function parseBaidu(html, count) {
+  const out = [];
+  const seen = new Set();
+  const clean = (s) => String(s || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const blocks = String(html || '').split(/<div[^>]*class="[^"]*c-container/).slice(1);
+  for (const body of blocks) {
+    if (out.length >= count) break;
+    const mu = /mu="([^"]+)"/.exec(body);
+    const h3 = /<h3[^>]*>([\s\S]*?)<\/h3>/.exec(body);
+    if (!mu || !h3) continue;
+    const url = String(mu[1]).replace(/&amp;/g, '&');
+    const title = clean(h3[1]);
+    if (!title || !/^https?:\/\//i.test(url) || seen.has(url)) continue;
+    // 百度自家的跳转页（如 /s?tn=news、nourl.ubs.baidu.com）没有阅读价值，跳过
+    if (/baidu\.com\/s\?|nourl\.ubs\.baidu\.com|www\.baidu\.com\/link/.test(url)) continue;
+    seen.add(url);
+    const abs = /<div[^>]*class="[^"]*c-abstract[^"]*"[^>]*>([\s\S]*?)<\/div>/.exec(body);
+    out.push({ title, url, snip: abs ? clean(abs[1]).slice(0, 200) : '' });
+  }
+  return out;
+}
+
+// 搜索引擎的「被限流/人机验证」特征。
+// DDG 的 html 端对部分出口 IP 直接返回 202 + 验证页，旧实现把它当成「无结果」，
+// 用户看到「搜索『x』无结果」——明明是没搜成，却说得像这个主题真的没有资料。
+function looksBlocked(html, status) {
+  if (status === 202 || status === 429) return true;
+  const h = String(html || '');
+  if (/<title>\s*(?:Captcha|Robot Check|Just a moment)/i.test(h)) return true;
+  if (/id="challenge-form"|class="anomaly-modal"|g-recaptcha|verify you are human|人机验证/i.test(h)) return true;
+  return false;
 }
 
 // ==================== 新增工具 4：GitHub 开源仓库详情与搜索（toolGithubLookup） ====================
@@ -494,6 +551,8 @@ async function toolTrendingNews(args) {
 export {
   parseDuckDuckGo,
   parseDuckDuckGoLite,
+  parseBaidu,
+  looksBlocked,
   htmlToStructuredText,
   toolWebSearch,
   toolWebFetch,

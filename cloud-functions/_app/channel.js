@@ -372,8 +372,25 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
-  if (!(maxTokens > 0)) maxTokens = 16384;
+  if (!(maxTokens > 0)) maxTokens = 4096;
   if (maxTokens > 32000) maxTokens = 32000;
+
+  // v7.9.0：temperature 之前完全没设，等于把「工具调用准不准」交给上游默认值 ——
+  // 不少通道默认 1.0，表现为参数漏字段、爱在 tool_calls 前后写解释。
+  // 默认 0.7，TEMPERATURE 可覆盖；推理模型（reasoner / r1 / o1 / o3）对温度敏感，
+  // 部分实现只接受 1，这类模型直接不传，交给上游默认。
+  let temperature = null;
+  const tempRaw = String(env.TEMPERATURE === undefined ? '' : env.TEMPERATURE).trim();
+  if (tempRaw !== '') {
+    const t = parseFloat(tempRaw);
+    if (t >= 0 && t <= 2) temperature = t;
+  } else {
+    temperature = 0.7;
+  }
+  if (temperature !== null &&
+      /reasoner|(^|[-_/.])r1([-_/.]|$)|(^|[-_/.])o[13]([-_/.]|$)/.test(String(selectedModel).toLowerCase())) {
+    temperature = null;
+  }
 
   // v6.8.9：图片通道取最后一条消息的纯文本。之前直接
   // messagesArray[len-1].content —— 空数组会 TypeError，多模态 content（分片数组）
@@ -405,6 +422,8 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     max_tokens: maxTokens,
   };
   if (tools && tools.length && !isImageAPI) payload.tools = tools;
+  // 图片通道不接受 temperature，且推理模型已在上方置空
+  if (temperature !== null && !isImageAPI) payload.temperature = temperature;
 
   return {
     apiUrl,

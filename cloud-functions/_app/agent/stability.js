@@ -4,13 +4,16 @@
 // 1) truncateToolResult：工具结果截断并明确标注，避免模型误以为拿到了完整数据。
 // 2) toolCallSignature：工具调用签名，用于"重复调用熔断"。
 // 3) trimAgentMessages：上下文预算裁剪，两级策略：
-//    第一级（删）——超预算时从最旧的"整轮"（1 条 assistant + 其 tool 消息）开始删，
+//    第一级（压）——超预算时先把「本轮循环内的旧消息」折叠成「头 + 尾」（compactContent），
+//                    只改 content、不动 role/tool_call_id，工具应答配对不会被破坏。
+//    第二级（删）——折叠完仍超预算（轮次太多，不是单条太大），才从最旧的"整轮"开始删，
 //                    成对删除保证 OpenAI 消息序列合法（assistant tool_calls 后必须紧跟 tool 应答）。
-//    第二级（压）——删完仍超预算，说明是单条巨型结果撑爆的（一次 web_fetch 可达 4000 字，
-//                    read_doc 可达 8000 字）。这时整条丢掉会直接丢失关键信息，
-//                    改为保留头尾、中间折叠，既压到预算内又不至于让模型答不上来。
+//    v7.9.0 把「删」和「压」的顺序对调了。旧实现先删后压，后果很具体：
+//    用户问「对比这三篇文档」，3 次 read_doc（各 8500 字）会把最早那篇整段删掉，
+//    模型手里只剩最后一篇——答案看起来完整，其实只比了一篇。折叠优先则三篇都在，
+//    只是每篇被压成 900+400 字，对比类任务至少能看到三篇的结论与要点。
 //    只动本轮循环产生的消息（loopStartIdx 之后），system 与历史对话永不裁剪；
-//    最后一条消息（刚发出 tool_calls 的 assistant）永不改动，否则会破坏工具应答配对。
+//    最后一条消息永不改动，否则会破坏工具应答配对。
 
 // 工具结果截断：超长时保留前 maxChars 并标注，避免模型误判为完整数据
 // v6.8.7：不在代理对中间切断 —— emoji 等增补平面字符占两个 code unit，
@@ -78,7 +81,7 @@ function toolCallSignature(tc) {
 
 // 按字符预算裁剪 Agent 循环消息；返回新数组（不修改原数组，便于测试与断点续存）
 function trimAgentMessages(messages, loopStartIdx, budget) {
-  budget = budget > 0 ? budget : 24000;
+  budget = budget > 0 ? budget : 28000;
   const arr = Array.isArray(messages) ? messages : [];
   if (arr.length <= 1) return arr.slice();
   // 裁剪边界：system 与历史对话（[0, start)）永不触碰
@@ -93,7 +96,42 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   for (let i = 0; i < lens.length; i++) total += lens[i];
   if (total <= budget) return out;
 
-  // ---------- 第一级：从最旧的整轮开始删 ----------
+  // ---------- 第一级：折叠（保住「存在性」，只压体积） ----------
+  // 候选：本轮循环内、除最后一条之外、内容够长的 tool / assistant 消息。
+  // 最后一条必须原样保留 —— 它带着刚发出的 tool_calls，改内容会破坏配对。
+  const foldCandidates = () => {
+    const idx = [];
+    for (let i = start; i < out.length - 1; i++) {
+      const m = out[i];
+      if (!m || (m.role !== 'tool' && m.role !== 'assistant')) continue;
+      if (typeof m.content !== 'string' || m.content.length < 400) continue;
+      idx.push(i);
+    }
+    // 先折叠最长的：同样的压缩量，损失的可读内容最少
+    idx.sort((a, b) => lens[b] - lens[a]);
+    return idx;
+  };
+  const foldPass = (keepHead, keepTail) => {
+    for (const i of foldCandidates()) {
+      if (total <= budget) break;
+      const m = out[i];
+      const compacted = compactContent(m.content, keepHead, keepTail);
+      if (compacted.length >= m.content.length) continue;
+      const next = Object.assign({}, m, { content: compacted });
+      const nl = msgLen(next);
+      if (nl >= lens[i]) continue;
+      total -= (lens[i] - nl);
+      lens[i] = nl;
+      out[i] = next;
+    }
+  };
+  // 两档：先温和（900/400，够看清结论），不够再激进（400/150，只留头尾关键词）
+  foldPass(900, 400);
+  if (total <= budget) return out;
+  foldPass(400, 150);
+  if (total <= budget) return out;
+
+  // ---------- 第二级：折叠后仍超预算（轮次太多）才删最旧的整轮 ----------
   // 找出本轮循环内的"轮次"边界：每轮以 role=assistant 开头
   const rounds = [];
   let cur = -1;
@@ -114,31 +152,6 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
     }
     out = kept;
     lens = keptLens;
-  }
-  if (total <= budget) return out;
-
-  // ---------- 第二级：折叠仍然过长的工具/助手消息 ----------
-  // 候选：本轮循环内、除最后一条之外、JSON 长度超过阈值的 tool / assistant 消息。
-  // 最后一条必须原样保留 —— 它带着刚发出的 tool_calls，改内容会破坏配对。
-  const candidates = [];
-  for (let i = start; i < out.length - 1; i++) {
-    const m = out[i];
-    if (!m || (m.role !== 'tool' && m.role !== 'assistant')) continue;
-    if (typeof m.content !== 'string' || !m.content) continue;
-    if (lens[i] > 1200) candidates.push(i);
-  }
-  candidates.sort((a, b) => lens[b] - lens[a]);
-  for (const i of candidates) {
-    if (total <= budget) break;
-    const m = out[i];
-    const compacted = compactContent(m.content, 900, 400);
-    if (compacted.length >= m.content.length) continue;
-    const next = Object.assign({}, m, { content: compacted });
-    const nl = msgLen(next);
-    if (nl >= lens[i]) continue;
-    total -= (lens[i] - nl);
-    lens[i] = nl;
-    out[i] = next;
   }
   return out;
 }

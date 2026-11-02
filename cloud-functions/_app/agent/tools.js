@@ -71,7 +71,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'web_search',
-        description: '联网搜索最新信息。仅在需要时效性内容（实时新闻、近期事件、赛事结果等）或问题超出你知识范围时使用；稳定的常识性知识不要搜，直接回答。',
+        description: '联网搜索最新信息。只用于时效性内容（实时新闻、近期事件、赛事结果）或超出你知识范围的问题；稳定常识不要搜，直接回答。',
         parameters: {
           type: 'object',
           properties: {
@@ -86,7 +86,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'web_fetch',
-        description: '抓取指定网页的结构化正文（保留标题、代码块、表格与列表，单次最多返回 6000 字符；长网页可传 offset 翻页续读）。只对搜索结果中或用户明确给出的 URL 使用，不要猜测/编造 URL。',
+        description: '抓取网页结构化正文（单次最多 6000 字符，长网页可传 offset 翻页）。只对搜索结果或用户给出的 URL 使用，不要编造 URL。',
         parameters: {
           type: 'object',
           properties: {
@@ -101,7 +101,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'wiki_lookup',
-        description: '查询维基百科（Wikipedia）权威词条摘要与相关条目，自动识别中英文。查人物、历史事件、科学概念、地理或专有名词的定义与背景时优先使用，比通用网页搜索更准确且无广告噪音。',
+        description: '查维基百科词条摘要与相关条目，自动识别中英文。人物、历史事件、科学概念、地理、专有名词优先用它。',
         parameters: {
           type: 'object',
           properties: {
@@ -116,7 +116,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'github_lookup',
-        description: '查询 GitHub 开源仓库详情（传入 owner/repo 如 "facebook/react" 可获取 Stars、Forks、Issues、协议、最新 Release 版本）或按关键词搜索高星开源项目。查开源项目、代码库或最新版本号时优先使用。',
+        description: '查 GitHub 仓库详情（传 owner/repo 得 Stars/Forks/协议/最新 Release），或按关键词搜高星开源项目。',
         parameters: {
           type: 'object',
           properties: {
@@ -132,7 +132,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'arxiv_search',
-        description: '检索 arXiv 预印本学术论文（计算机、人工智能、物理、数学等），返回论文标题、作者、发表日期、摘要及 PDF 链接。用户询问学术论文、前沿算法研究时优先使用。',
+        description: '检索 arXiv 预印本论文，返回标题、作者、发表日期、摘要与 PDF 链接。',
         parameters: {
           type: 'object',
           properties: {
@@ -148,7 +148,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'trending_news',
-        description: '获取实时科技与开源热榜：支持 Hacker News 实时热门资讯（source="hn"）与 GitHub 近期飙升开源项目榜（source="github"）。当用户问"今天科技圈有什么热门新闻"或"最近 GitHub 有什么火的项目"时直接调用。',
+        description: '实时热榜：Hacker News 科技热榜（source=hn，默认）或 GitHub 近两周飙升项目（source=github）。',
         parameters: {
           type: 'object',
           properties: {
@@ -163,7 +163,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'exchange_rate',
-        description: '查询实时法币汇率换算（支持 USD/CNY/JPY/EUR/HKD/TWD/GBP 等全球货币）及主流加密货币实时价格与 24h 涨跌（BTC/ETH/SOL/BNB/DOGE/XRP/TON/SUI 等）。查汇率或币价时优先用它，不要用 web_search。',
+        description: '实时汇率换算（USD/CNY/JPY/EUR 等）与加密货币价格及 24h 涨跌。查汇率或币价用它，不要用 web_search。',
         parameters: {
           type: 'object',
           properties: {
@@ -179,7 +179,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'calculate',
-        description: '精确科学与统计计算器，支持四则运算、乘方(^)、取余(%)、括号、科学记数法、常量(pi, e, tau, phi)以及函数：sqrt, cbrt, abs, sign, trunc, round(x,n), floor, ceil, sin, cos, tan, asin, acos, atan, atan2(y,x), sinh, cosh, tanh, deg, rad, ln, log(x,base), log10, log2, exp, pow(a,b), hypot, min, max, sum, avg/mean, median, std, var, gcd, lcm, fact(n), comb(n,k)/ncr, perm(n,k)/npr。任何数学或统计运算都用它，不要心算。',
+        description: '精确计算器：四则运算、乘方(^)、取余、括号、常量(pi/e/tau/phi)及 sqrt/cbrt/round/log/ln/sin/atan2/hypot/min/max/sum/avg/median/std/var/gcd/lcm/fact/comb/perm 等函数。任何数学或统计运算都用它，不要心算。',
         parameters: {
           type: 'object',
           properties: {
@@ -193,7 +193,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'unit_convert',
-        description: '精确单位换算与进制转换器。支持长度(mm/cm/m/km/in/ft/yd/mi/nmi/寸/尺/里)、重量(mg/g/kg/t/oz/lb/斤/两/克拉)、温度(C/F/K)、面积(m2/km2/sq_ft/acre/ha/亩/坪)、体积(ml/l/m3/fl_oz/cup/pt/qt/gal)、速度(m/s,km/h,mph,knot,mach)、数据存储(bit/B/KB/MB/GB/TB/PB)以及 2~36 进制大整数互转（传 base_from / base_to）。',
+        description: '单位与进制换算：长度、重量、温度、面积、体积、速度、数据存储，以及 2~36 进制大整数互转（传 base_from/base_to）。',
         parameters: {
           type: 'object',
           properties: {
@@ -211,7 +211,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'text_toolkit',
-        description: '文本与编码工具箱：支持精确统计字数/汉字数/英文词数/行数/UTF-8字节数（action="stats"）、计算 SHA-256/SHA-1/SHA-512 哈希摘要（action="hash"）、Base64 编解码（base64_encode / base64_decode）、URL 编解码（url_encode / url_decode）及生成随机 UUID v4（action="uuid"）。凡需精确字数统计、哈希或编码转换时必须调用，不要心算字数或编码。',
+        description: '文本与编码工具箱：字数/汉字/词/行/UTF-8 字节统计（stats）、SHA 哈希（hash）、Base64、URL 编解码、生成 UUID。需精确字数或编码转换时必须调用。',
         parameters: {
           type: 'object',
           properties: {
@@ -228,7 +228,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'network_lookup',
-        description: '查询 IP 地址（IPv4/IPv6）的地理位置、运营商 ISP、自治系统号 ASN，或查询域名的 DNS 解析记录（A/AAAA/CNAME/MX/TXT/NS）。排查网络、查询域名解析或 IP 归属地时使用。',
+        description: '查 IP（IPv4/IPv6）归属地、运营商、ASN，或域名 DNS 记录（A/AAAA/CNAME/MX/TXT/NS）。',
         parameters: {
           type: 'object',
           properties: {
@@ -243,7 +243,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'get_time',
-        description: '获取当前时间（可指定 IANA 时区），并支持精确日期推算：计算两个日期之间相差多少天/周（target_date），或计算某日期加减 N 天后的具体日期与星期几（add_days）。遇到时间、日期差、倒计时推算时必须用它，不要心算日历。',
+        description: '获取当前时间（可指定 IANA 时区），或算两个日期的天数差（target_date）、某日期加减 N 天（add_days）。不要心算日历。',
         parameters: {
           type: 'object',
           properties: {
@@ -259,7 +259,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'get_weather',
-        description: '查询指定城市当前天气与未来三天预报（含温度、湿度、风速及降水概率）。city 必须给明确城市名（如"北京"、"Tokyo"）；用户没说城市时先追问，不要猜。',
+        description: '查城市当前天气与未来三天预报（温度、湿度、风速、降水概率）。用户没说城市先追问，不要猜。',
         parameters: {
           type: 'object',
           properties: {
@@ -273,7 +273,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'remember',
-        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市），存入后以后所有对话都会记得。仅在用户明确要求记住（"记住…"）时调用，不要把临时对话内容存进去。同一主题（如"我的手机号是…"）改口后直接记住新值即可：旧值会被自动覆盖更新，无需先删除。',
+        description: '保存关于用户的长期事实（偏好、生日、项目名、常用城市）。仅用户明确要求记住时调用。同一主题改口直接记新值，旧值自动覆盖。',
         parameters: {
           type: 'object',
           properties: {
@@ -287,7 +287,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'forget_memory',
-        description: '按关键词删除已保存的用户长期记忆。仅在用户明确要求忘掉/删除某条记忆（如"忘掉我之前的住址"、"删掉关于猫的记忆"）时调用。',
+        description: '按关键词删除已保存的用户长期记忆。仅用户明确要求忘掉/删除某条记忆时调用。',
         parameters: {
           type: 'object',
           properties: {
@@ -301,7 +301,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'save_doc',
-        description: '把长篇内容保存为知识库文档，真实写入 R2 的 kb/docs/ 文件夹（文件名取自标题）。仅在用户明确要求保存文档（"保存成文档/存到知识库/生成知识库文件"）时调用；简短的个人信息用 remember，不要用它；不要主动为普通回答生成文档。只有本工具返回成功，才可以告诉用户"已保存/已生成"；失败或没调用时绝不声称已保存。',
+        description: '把长篇内容保存为知识库文档（写入 kb/docs/，文件名取自标题）。仅用户明确要求保存文档时调用；简短个人信息用 remember。只有它返回成功才能说已保存。',
         parameters: {
           type: 'object',
           properties: {
@@ -317,7 +317,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'list_docs',
-        description: '列出知识库文档（标题 + 体积 + 更新时间，按最近更新排序）。想通览有哪些文档时用；只知道主题、不确定是哪一篇时，用 search_docs 按关键词检索全文更准。',
+        description: '列出知识库文档（标题 + 体积 + 更新时间，按最近更新倒序）。只想确认有哪些文档时用；不确定是哪篇就用 search_docs。',
         parameters: { type: 'object', properties: {} }
       }
     },
@@ -325,7 +325,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'search_docs',
-        description: '在知识库全部文档里做全文检索（标题 + 正文，支持多关键词与中文 2-gram），返回相关性最高的若干片段，以及所属文档名与该片段在全文中的 offset。当你想确认"知识库里有没有讲过 X"、或不确定该读哪一篇时，先用它；已知确切标题要读整篇时用 read_doc。',
+        description: '在知识库全部文档里全文检索（标题 + 正文，支持多关键词与中文 2-gram），返回相关性最高的片段及其文档名与 offset。不确定该读哪篇、或要确认讲过没讲过时先用它。',
         parameters: {
           type: 'object',
           properties: {
@@ -340,7 +340,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'read_doc',
-        description: '按标题读取知识库文档正文（单次返回 8000 字）。文档比一页长时，首次返回会附带【章节目录】（含每节的 offset），可直接传 offset 跳到需要的章节，不必逐页翻。query 给标题；标题对不上时会自动退回全库检索并返回最相关的 Top 3 片段。',
+        description: '按标题读知识库文档正文（单次 8000 字）。超一页时首次返回【章节目录】含每节 offset，可直接跳节不必逐页翻；标题对不上会自动退回全库检索并返回 Top 3 片段。',
         parameters: {
           type: 'object',
           properties: {
@@ -355,7 +355,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'delete_doc',
-        description: '删除一篇知识库文档（R2 kb/docs/）。仅在用户明确要求删除文档时调用；query 给标题或关键词模糊匹配，找不到会返回现有标题列表。删除不可逆，调用前确保用户意图明确。',
+        description: '删除一篇知识库文档（不可逆）。仅用户明确要求删除文档时调用；query 给标题或关键词，找不到会返回现有标题列表。',
         parameters: {
           type: 'object',
           properties: {

@@ -71,6 +71,12 @@ async function handleWebAgent(env, body) {
       try {
         const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
         let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, webOpts);
+        // v7.9.0：通道拒收 tools 时先降级为「文本调用模式」（工具仍能执行），
+        // 再不行才彻底关工具 —— 旧实现一步跳到「没有工具」，用户拿到残废答案且毫不知情。
+        if (r.fallback) {
+          r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress,
+            Object.assign({}, webOpts, { promptTools: true }));
+        }
         if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, webOpts);
         if (r.error) {
           send({ agent_error: r.error });

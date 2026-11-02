@@ -1251,7 +1251,8 @@ async function processWechatMessage(env, creds, rawMsg) {
         resumeKey: tgAgentResumeKey(chatId),
         origUserText: historyUserText,
       };
-      const runAgentTurn = (allowTools) => {
+      const runAgentTurn = (allowTools, extraOpts) => {
+        const opts = extraOpts ? Object.assign({}, agentOpts, extraOpts) : agentOpts;
         if (resumeState) {
           return tgAgentResume(env, wxCompatApi, chatId, {
             targetModelId: resumeState.targetModelId || activeModelId,
@@ -1259,14 +1260,16 @@ async function processWechatMessage(env, creds, rawMsg) {
             messages: resumeState.messages,
             loopStartIdx: resumeState.loopStartIdx,
             origUserText: resumeState.origUserText || '',
-          }, onProgress, agentOpts);
+          }, onProgress, opts);
         }
-        return tgAgentChat(env, wxCompatApi, chatId, activeModelId, history, allowTools, onProgress, agentOpts);
+        return tgAgentChat(env, wxCompatApi, chatId, activeModelId, history, allowTools, onProgress, opts);
       };
 
       let r;
       try {
         r = await runAgentTurn(true);
+        // v7.9.0：先降级为文本调用模式（工具仍执行），再考虑彻底关工具
+        if (r.fallback) r = await runAgentTurn(true, { promptTools: true });
         if (r.fallback) r = await runAgentTurn(false);
       } catch (e) {
         r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };

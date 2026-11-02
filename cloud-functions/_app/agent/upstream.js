@@ -22,6 +22,18 @@ async function readUpstreamMessage(resp, onDelta) {
   const toolMap = new Map(); // 按 index 合并流式 tool_calls 分片
   let sawSSE = false;
   let sawToolCalls = false;  // 一旦出现工具调用，这一步的后续正文不再外发
+  // v7.9.0：token 用量。OpenAI 规范把 usage 放在最后一帧的顶层；部分兼容实现放在
+  // choice 里，两种都收。拿不到就保持 null —— 不估算，估算出来的数字比没有更误导。
+  let usage = null;
+  const takeUsage = (u) => {
+    if (!u || typeof u !== 'object') return;
+    const p = Number(u.prompt_tokens || u.input_tokens || 0);
+    const c = Number(u.completion_tokens || u.output_tokens || 0);
+    if (!(p > 0) && !(c > 0)) return;
+    if (!usage) usage = { prompt_tokens: 0, completion_tokens: 0 };
+    usage.prompt_tokens += p;
+    usage.completion_tokens += c;
+  };
 
   const emit = async (text, kind) => {
     if (!text || typeof onDelta !== 'function') return;
@@ -46,6 +58,8 @@ async function readUpstreamMessage(resp, onDelta) {
       throw err;
     }
     const choice = ev && ev.choices && ev.choices[0];
+    if (ev && ev.usage) takeUsage(ev.usage);
+    if (choice && choice.usage) takeUsage(choice.usage);
     if (!choice) return false;
     // 部分通道把完整 message 塞在一个 chunk 里（非增量），delta / message 两种都兼容
     const d = choice.delta || choice.message || {};
@@ -107,19 +121,21 @@ async function readUpstreamMessage(resp, onDelta) {
       }
       const ch = j && j.choices && j.choices[0];
       const m = ch && (ch.message || ch.delta);
+      if (j && j.usage) takeUsage(j.usage);
       if (m) {
         return {
           content: m.content || '',
           reasoning: m.reasoning_content || m.reasoning || '',
           toolCalls: m.tool_calls || [],
-          forwarded: false
+          forwarded: false,
+          usage
         };
       }
     } catch (e) {}
   }
 
   const toolCalls = Array.from(toolMap.keys()).sort((a, b) => a - b).map(k => toolMap.get(k));
-  return { content, reasoning, toolCalls, forwarded };
+  return { content, reasoning, toolCalls, forwarded, usage };
 }
 
 export {

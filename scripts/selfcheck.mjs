@@ -2905,6 +2905,174 @@ async function main() {
     assert.match(r3, /第二篇缓存文档/, '保存后必须立刻能搜到新文档');
   });
 
+  console.log('\n=== 18. Agent 深水区修复（v7.9.0）===');
+
+  await checkAsync('上下文裁剪先折叠后删除：三篇 read_doc 全部保留（对比类任务不再只剩最后一篇）', () => {
+    const sys = { role: 'system', content: '乙'.repeat(8532) };
+    const msgs = [sys, { role: 'user', content: '对比三篇文档' }];
+    for (let i = 0; i < 3; i++) {
+      msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: 't' + i, type: 'function', function: { name: 'read_doc', arguments: '{}' } }] });
+      msgs.push({ role: 'tool', tool_call_id: 't' + i, name: 'read_doc', content: ('第' + i + '篇').repeat(3000) });
+    }
+    msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: 'z', type: 'function', function: { name: 'read_doc', arguments: '{}' } }] });
+    const out = stabilityMod.trimAgentMessages(msgs, 2, 24000);
+    const tools = out.filter(m => m.role === 'tool');
+    assert.equal(tools.length, 3, '三篇文档都要在（旧实现只剩 1 篇）');
+    assert.ok(tools.some(t => String(t.content).indexOf('已折叠') > 0), '超长的应被折叠');
+    const total = out.reduce((n, m) => n + JSON.stringify(m).length, 0);
+    assert.ok(total <= 24000, '折叠后应在预算内，实际 ' + total);
+  });
+
+  await checkAsync('折叠仍超预算才删整轮（轮次太多时的兜底，且最后一条永不改）', () => {
+    const sys = { role: 'system', content: '乙'.repeat(8000) };
+    const msgs = [sys, { role: 'user', content: 'x' }];
+    for (let i = 0; i < 40; i++) {
+      msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: 'a' + i, type: 'function', function: { name: 'web_search', arguments: '{}' } }] });
+      msgs.push({ role: 'tool', tool_call_id: 'a' + i, name: 'web_search', content: '丙'.repeat(3000) });
+    }
+    msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: 'z', type: 'function', function: { name: 'x', arguments: '{}' } }] });
+    const out = stabilityMod.trimAgentMessages(msgs, 2, 24000);
+    assert.ok(out.length < msgs.length, '应删掉一部分轮次');
+    const total = out.reduce((n, m) => n + JSON.stringify(m).length, 0);
+    assert.ok(total <= 24000, '最终必须在预算内，实际 ' + total);
+    assert.equal(out[out.length - 1].tool_calls[0].id, 'z', '最后一条永不改动');
+  });
+
+  await checkAsync('工具失败不占重复熔断名额：同参连续失败仍会真的执行（不被「已跳过」吃掉）', async () => {
+    const prev = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      let body = {};
+      try { body = JSON.parse(init && init.body); } catch (e) {}
+      if (!Array.isArray(body.tools) || !body.tools.length) {
+        return sseFromEvents([deltaEvent({ content: '（抓不到）' })]);
+      }
+      // 同一参数、必然失败：URL 非法，不产生任何网络请求
+      return sseFromEvents([toolCallEvent('c' + calls, 'web_fetch', '{"url":"not-a-url"}')]);
+    };
+    const stats = {};
+    try {
+      await loopMod.tgAgentRunLoop(
+        loopEnv({ AGENT_MAX_STEPS: '5', AGENT_TOOL_CACHE: '0' }), () => Promise.resolve({ ok: true }), 'c-failrepeat', 'm1',
+        [{ role: 'system', content: 'sys' }, { role: 'user', content: '抓一下' }],
+        agentToolsMod.getAgentTools(false), true, null, Date.now() + 30000,
+        null, false, undefined, null, null, false, '', stats
+      );
+      assert.equal(stats.skipped, 0, '失败不该被算成重复调用');
+      assert.equal(stats.toolCalls, 4, '4 步都应真的执行了工具（旧实现第 3 次就被跳过）');
+    } finally { globalThis.fetch = prev; }
+  });
+
+  await checkAsync('预检索命中时文档列表只列 8 篇（省 2k+ 字符，也少一份干扰）', () => {
+    const docs = Array.from({ length: 45 }, (_, i) => ({ title: '笔记' + i, file: 'n' + i + '.md', updated_at: '2026-10-01' }));
+    const pre = '【知识库预检索结果】\n' + '甲'.repeat(2000);
+    const withPre = promptMod.buildAgentSystemPrompt([], '笔记 3', docs, true, pre);
+    const without = promptMod.buildAgentSystemPrompt([], '笔记 3', docs, true, '');
+    const countIn = (s) => (s.match(/^- 《/gm) || []).length;
+    assert.equal(countIn(withPre), 8, '有预检索时只列 8 个标题');
+    assert.equal(countIn(without), 45, '没有预检索时标题列表仍是主要线索，不截断');
+  });
+
+  await checkAsync('20 项工具定义总体积受控（≤ 7800 字符，避免每步白烧 token）', () => {
+    const size = JSON.stringify(agentToolsMod.getAgentTools(false)).length;
+    assert.ok(size <= 7800, '实际 ' + size + ' 字符');
+  });
+
+  await checkAsync('通道拒收 tools 时降级为文本调用模式：payload 无 tools，DSML 调用仍会执行', async () => {
+    const prev = globalThis.fetch;
+    let sawTools = null;
+    let sysText = '';
+    let calls = 0;
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      const body = JSON.parse(init.body);
+      sawTools = Array.isArray(body.tools) && body.tools.length > 0;
+      sysText = String(body.messages[0].content);
+      if (calls === 1) {
+        return sseFromEvents([deltaEvent({
+          content: '<|DSML|tool_calls><|DSML|invoke name="calculate"><|DSML|parameter name="expression" string="true">1+1</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>'
+        })]);
+      }
+      return sseFromEvents([deltaEvent({ content: '答案是 2。' })]);
+    };
+    try {
+      const r = await loopMod.tgAgentChat(
+        loopEnv(), () => Promise.resolve({ ok: true }), 'c-prompttools', 'm1',
+        [{ role: 'user', content: '1+1 等于几' }], true, null,
+        { promptTools: true, maxRuntimeMs: 30000 }
+      );
+      assert.equal(sawTools, false, '降级模式不应再发送 tools 字段');
+      assert.match(sysText, /【可用工具（文本调用模式）】/);
+      assert.match(sysText, /DSML\|tool_calls/);
+      assert.match(r.text, /答案是 2/, 'DSML 调用应被执行并回填结果');
+    } finally { globalThis.fetch = prev; }
+  });
+
+  await checkAsync('上游回传 usage 时计入统计（/healthz 可见 token 与真实 prompt 体积）', async () => {
+    const prev = globalThis.fetch;
+    globalThis.fetch = async () => {
+      const body = 'data: ' + JSON.stringify(deltaEvent({ content: '你好' })) + '\n\n'
+        + 'data: ' + JSON.stringify({ choices: [], usage: { prompt_tokens: 1200, completion_tokens: 30 } }) + '\n\n'
+        + 'data: [DONE]\n\n';
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+    try {
+      const r = await loopMod.tgAgentChat(loopEnv(), () => Promise.resolve({ ok: true }), 'c-usage', 'm1',
+        [{ role: 'user', content: '你好' }], false, null, { maxRuntimeMs: 30000 });
+      assert.equal(r.stats.promptTokens, 1200);
+      assert.equal(r.stats.completionTokens, 30);
+      assert.ok(r.stats.promptChars > 0, '应记录真实请求体体积（含工具定义）');
+      const res = await mod.handle({ request: new Request('https://example.com/healthz'), env: { STORAGE_DEBUG: '1' }, waitUntil: () => {} });
+      const j = await res.json();
+      assert.ok(j.debug.agent.promptTokens >= 1200);
+      assert.equal(typeof j.debug.agent.avgPromptChars, 'number');
+    } finally { globalThis.fetch = prev; }
+  });
+
+  await checkAsync('DDG 返回验证页时回退到百度（中文查询不再被误报「无结果」）', async () => {
+    const prev = globalThis.fetch;
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      if (String(url).indexOf('duckduckgo') !== -1) {
+        return new Response('<html><title>Captcha</title><body>challenge</body></html>', { status: 202, headers: { 'content-type': 'text/html' } });
+      }
+      return new Response('<div class="result c-container" mu="https://cloud.tencent.com/"><h3>腾讯云 EdgeOne</h3></div>', { status: 200, headers: { 'content-type': 'text/html' } });
+    };
+    try {
+      const out = await toolsWebMod.toolWebSearch('腾讯云 EdgeOne', 5);
+      assert.match(out, /腾讯云 EdgeOne/);
+      assert.match(out, /cloud\.tencent\.com/);
+      assert.ok(seen.some(u => u.indexOf('baidu.com') !== -1), '应回退到百度');
+    } finally { globalThis.fetch = prev; }
+  });
+
+  await checkAsync('全部引擎被限流时明确说「被限流」，不再谎报「无结果」', async () => {
+    const prev = globalThis.fetch;
+    globalThis.fetch = async () => new Response('<html><title>Captcha</title></html>', { status: 202, headers: { 'content-type': 'text/html' } });
+    try {
+      const out = await toolsWebMod.toolWebSearch('测试查询', 5);
+      assert.match(out, /被上游限流/);
+      assert.equal(/无结果/.test(out), false, '不能把「没搜成」说成「没资料」');
+      assert.equal(resultMod.isToolFailure(out), true, '限流应算工具失败，便于熔断与提示');
+    } finally { globalThis.fetch = prev; }
+  });
+
+  await checkAsync('temperature 默认 0.7、推理模型不传、TEMPERATURE 可覆盖；MAX_TOKENS 非法值回退 4096', () => {
+    const base = { API_URL_1: 'https://up.example/v1/chat/completions', MODEL_1: 'm1:普通模型', API_KEY_1: 'k1' };
+    const msgs = [{ role: 'user', content: 'hi' }];
+    const p1 = agentChannelMod.buildAIRequest(base, 'm1', msgs, false, null).payload;
+    assert.equal(p1.temperature, 0.7);
+    const p2 = agentChannelMod.buildAIRequest(Object.assign({}, base, { TEMPERATURE: '0' }), 'm1', msgs, false, null).payload;
+    assert.equal(p2.temperature, 0, 'TEMPERATURE=0 要生效（不能被 || 吞掉）');
+    const rEnv = { API_URL_1: 'https://up.example/v1/chat/completions', MODEL_1: 'r1:deepseek-reasoner', API_KEY_1: 'k1' };
+    const p3 = agentChannelMod.buildAIRequest(rEnv, 'r1', msgs, false, null).payload;
+    assert.equal('temperature' in p3, false, '推理模型不传 temperature');
+    const p4 = agentChannelMod.buildAIRequest(Object.assign({}, base, { MAX_TOKENS: 'abc' }), 'm1', msgs, false, null).payload;
+    assert.equal(p4.max_tokens, 4096, '非法 MAX_TOKENS 应回退到文档写明的 4096');
+  });
+
   console.log('\n=== 结果 ===');
   console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
   if (fail > 0) process.exit(1);

@@ -62,16 +62,20 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchT
       return { e, s, ts };
     });
     scored.sort((a, b) => (b.s - a.s) || (b.ts - a.ts));
-    let budget = 3000;
+    // v7.9.0：预检索命中时，正文片段已经在提示词里了，这里只留最相关的 8 个标题回答
+    // 「还有哪些相关文档」，不再铺 60 行 —— 省 2~3k 字符，也少一份跟正文抢注意力的干扰。
+    // 预检索没命中时仍然列 60 篇：那时标题列表是模型唯一的线索。
+    const listLimit = hasPrefetch ? 8 : 60;
+    let budget = hasPrefetch ? 700 : 3000;
     const shown = [];
     for (const item of scored) {
-      if (shown.length >= 60 || budget <= 0) break;
+      if (shown.length >= listLimit || budget <= 0) break;
       const e = item.e;
       const meta = [];
       const date = String(e.updated_at || '').slice(0, 10);
       if (date) meta.push(date);
       const src = String(e.source || '');
-      if (src) meta.push('来源：' + src.slice(0, 120));
+      if (src && !hasPrefetch) meta.push('来源：' + src.slice(0, 120));
       const line = '- 《' + (e.title || e.file) + '》' + (meta.length ? '（' + meta.join('，') + '）' : '');
       if (line.length > budget) break;
       shown.push(line);
@@ -131,6 +135,30 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchT
   return p;
 }
 
+// 降级模式（通道 400 拒绝 tools 参数）下，把工具清单与调用格式写进系统提示词。
+// 格式与 agent/dsml.js 的解析器严格对应：改这里的标记必须同步改解析器，否则工具永远解析不出来。
+function buildPromptToolManual(tools) {
+  const list = Array.isArray(tools) ? tools : [];
+  if (!list.length) return '';
+  const lines = [];
+  for (const t of list) {
+    const f = (t && t.function) || {};
+    if (!f.name) continue;
+    const props = (f.parameters && f.parameters.properties) || {};
+    const req = new Set((f.parameters && f.parameters.required) || []);
+    const params = Object.keys(props).map(k => k + (req.has(k) ? '' : '?')).join(', ');
+    // 只取描述的第一句：这里要的是「这个工具干什么」，不是完整参数手册
+    const desc = String(f.description || '').split(/[。；\n]/)[0].slice(0, 90);
+    lines.push('- ' + f.name + '(' + params + ')：' + desc);
+  }
+  return '\n【可用工具（文本调用模式）】\n'
+    + '本通道不支持原生函数调用，请用下面的标记发起工具调用（一次可写多个 invoke）：\n'
+    + '<|DSML|tool_calls><|DSML|invoke name="工具名"><|DSML|parameter name="参数名" string="true">参数值</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>\n'
+    + '数字/布尔参数把 string 写成 "false"。标记之外不要写解释。工具结果会以 role=tool 的消息返回，拿到后继续推理。\n'
+    + lines.join('\n') + '\n';
+}
+
 export {
   buildAgentSystemPrompt,
+  buildPromptToolManual,
 };

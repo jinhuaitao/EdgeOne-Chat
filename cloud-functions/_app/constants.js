@@ -18,6 +18,10 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
+// 7.9.0：Agent 深水区修复 —— 上下文裁剪改为先折叠后删除（多文档对比不再只剩一篇）、
+//        重复调用熔断只统计成功次数（失败重试不再被判原地打转）、工具描述与文档列表瘦身、
+//        通道拒收 tools 时降级为 DSML 文本调用模式、usage/token 与真实 prompt 体积统计、
+//        web_search 增加百度回退与限流识别、temperature 默认 0.7。
 // 7.8.0：知识库改为 Web 端恒定优先 —— 移除「📚 知识库」开关（误触关掉后回答质量断崖下跌
 //        且无人知道原因），请求体不再带 kb_first，预检索默认执行；升级时清理历史偏好
 //        eochat_kb_first。运维级关闭仍可用 WEB_KB_FIRST=0，外部调用仍可传 kb_first=false。
@@ -30,7 +34,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 7.5.0：Agent 精修 —— 时间预算治理（工具/上游超时随剩余预算收缩 + 收尾预留）、
 //        跨步重复调用熔断、无新信息检测、上下文二级压缩、reasoning_content 回传策略。
 // 7.4.0：同步新增微信 ClawBot（腾讯官方 iLink Bot API / openclaw-weixin 协议）通道支持 + 四重防盗绑安全锁。
-const APP_VERSION = '7.8.0';
+const APP_VERSION = '7.9.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

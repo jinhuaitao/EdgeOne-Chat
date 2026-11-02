@@ -22,11 +22,12 @@ import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
 import { getAgentTools, execAgentTool, getAgentToolCacheStats } from './tools.js';
 import { agentGetMemories } from './memory.js';
-import { buildAgentSystemPrompt } from './prompt.js';
+import { buildAgentSystemPrompt, buildPromptToolManual } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { kbPrefetch } from '../kb/prefetch.js';
 
-// 同一工具 + 同一参数，本轮累计调用到第 3 次就不再执行（结果必然一样），第 4 次直接收尾
+// 同一工具 + 同一参数，本轮累计「成功执行」到第 3 次就不再执行（结果必然一样），第 4 次直接收尾。
+// 只数成功次数：失败不占名额（v7.9.0），否则网络抖一下、重试两次就被判成原地打转。
 const REPEAT_SKIP_AT = 3;
 const REPEAT_STOP_AT = 4;
 // 连续几步「没有任何新信息」就收尾
@@ -50,12 +51,22 @@ const turnStats = {
   failedTotal: 0,
   pausedTurns: 0,
   timedOutTurns: 0,
+  promptCharsTotal: 0,
+  promptTokensTotal: 0,
+  completionTokensTotal: 0,
   lastStopReason: '',
   lastElapsedMs: 0,
 };
 
 function newTurnStats() {
-  return { startedAt: Date.now(), steps: 0, toolCalls: 0, failed: 0, skipped: 0, stopReason: '' };
+  return {
+    startedAt: Date.now(), steps: 0, toolCalls: 0, failed: 0, skipped: 0, stopReason: '',
+    // v7.9.0：promptChars = 最近一步真实发出的请求体字符数（含工具定义），
+    // 用来暴露「配置的上下文预算 ≠ 实际 prompt 体积」这个盲区。
+    promptChars: 0,
+    // 上游给了 usage 才累加（部分通道不回传，保持 0 比编一个数字诚实）
+    promptTokens: 0, completionTokens: 0,
+  };
 }
 
 function commitTurnStats(stats, r) {
@@ -69,6 +80,9 @@ function commitTurnStats(stats, r) {
     turnStats.stepsTotal += stats.steps || 0;
     turnStats.toolCallsTotal += stats.toolCalls || 0;
     turnStats.failedTotal += stats.failed || 0;
+    turnStats.promptCharsTotal += stats.promptChars || 0;
+    turnStats.promptTokensTotal += stats.promptTokens || 0;
+    turnStats.completionTokensTotal += stats.completionTokens || 0;
     if (r && r.paused) turnStats.pausedTurns += 1;
     if (stopReason === 'time_budget') turnStats.timedOutTurns += 1;
     turnStats.lastStopReason = stopReason;
@@ -81,6 +95,9 @@ function commitTurnStats(stats, r) {
         skipped: stats.skipped || 0,
         elapsedMs,
         stopReason,
+        promptChars: stats.promptChars || 0,
+        promptTokens: stats.promptTokens || 0,
+        completionTokens: stats.completionTokens || 0,
       };
     }
   } catch (e) {}
@@ -98,6 +115,10 @@ function agentTurnStats() {
     avgFailed: avg(t.failedTotal),
     pausedTurns: t.pausedTurns,
     timedOutTurns: t.timedOutTurns,
+    // 每轮平均 prompt 体积（含工具定义）与累计 token —— 调预算/换模型时看这两个数
+    avgPromptChars: avg(t.promptCharsTotal),
+    promptTokens: t.promptTokensTotal,
+    completionTokens: t.completionTokensTotal,
     lastStopReason: t.lastStopReason || '',
     lastElapsedMs: t.lastElapsedMs,
     cache,
@@ -111,6 +132,9 @@ function __resetAgentTurnStats() {
   turnStats.failedTotal = 0;
   turnStats.pausedTurns = 0;
   turnStats.timedOutTurns = 0;
+  turnStats.promptCharsTotal = 0;
+  turnStats.promptTokensTotal = 0;
+  turnStats.completionTokensTotal = 0;
   turnStats.lastStopReason = '';
   turnStats.lastElapsedMs = 0;
 }
@@ -208,7 +232,14 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
       if (pre && pre.ok) kbPrefetchText = pre.text;
     }
   }
-  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText);
+  let systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText);
+  // 降级模式：通道 400 拒绝 tools 参数时，把工具清单与调用格式写进提示词，
+  // 由模型用 DSML 文本格式发起调用（loop 里原本就有 DSML 解析，这里只是让它有输入）。
+  // 旧实现遇到这种通道直接 allowTools=false —— 用户拿到的是一个"没有工具"的答案，
+  // 而且没有任何提示说明能力被砍掉了。
+  if (allowTools && opts && opts.promptTools) {
+    systemPrompt += buildPromptToolManual(getAgentTools(kbReadOnly));
+  }
   const tools = allowTools ? getAgentTools(kbReadOnly) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });
@@ -217,7 +248,8 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const stats = newTurnStats();
   const r = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText, stats);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText, stats,
+    !!(opts && opts.promptTools));
   // fallback 表示「这个通道不支持 tools」，会立刻用不带工具的方式重跑一遍；
   // 那一轮不计入统计，否则 avgSteps 会被一堆 0 步的降级轮稀释。
   if (!(r && r.fallback)) commitTurnStats(stats, r);
@@ -233,19 +265,23 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const stats = newTurnStats();
   const r = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, false, saved.origUserText || '', stats);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, false, saved.origUserText || '', stats,
+    !!(saved.promptTools || (opts && opts.promptTools)));
   commitTurnStats(stats, r);
   return r;
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, stats) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, stats, promptTools) {
   const limits = agentLimits(env);
   const maxSteps = limits.maxSteps;
   // 收尾预留：循环内所有「还能不能再跑一步」的判断都用 deadline - reserve
   const reserve = limits.wrapupReserveMs;
   const ctxBudget = (() => {
-    const v = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
-    return v > 0 ? v : 24000;
+    // v7.9.0：默认 24000 → 28000。24000 是「消息字符数」，不含每步都要发的工具定义
+    // （约 7.5k）与系统提示词，实际 prompt 会到 35k+；多篇文档一读就被迫裁剪。
+    // 真实体积见 /healthz 的 debug.agent.avgPromptChars。
+    const v = parseInt(env.AGENT_CONTEXT_BUDGET || '28000', 10);
+    return v > 0 ? v : 28000;
   })();
   const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
   // 统计对象可能是调用方传进来的空壳，补齐默认字段（否则 += 会得到 NaN）。
@@ -277,7 +313,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
       messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
       loopStartIdx: loopStartIdx,
-      origUserText: origUserText || ''
+      origUserText: origUserText || '',
+      // 续做时保持同样的工具模式：降级通道不能因为「继续」又变回原生 tools
+      promptTools: !!promptTools
     });
   };
 
@@ -313,9 +351,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   }, 20000);
   try {
   // 跨步去重与防呆状态
-  const sigCount = new Map();       // 工具签名 → 本轮累计调用次数
+  const sigSuccess = new Map();     // 工具签名 → 本轮「成功执行」次数（失败不计，见下方注释）
   const seenResults = new Set();    // 已见结果指纹
-  const recentBatchSigs = [];       // 最近两步的调用批次签名（判「连续原地打转」）
+  const recentBatches = [];         // 最近两步的调用批次：{ sig, failed }（判「连续原地打转」）
   let noProgressStreak = 0;
   let failStreak = 0;
   let totalFailed = 0;
@@ -341,8 +379,13 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 
     const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget);
-    const cfg = buildAIRequest(env, targetModelId, sendMessages, useUpstreamStream, tools);
+    // promptTools 是「通道不收 tools 参数」时的降级模式：工具清单写进提示词，
+    // 由模型用 DSML 文本格式发起调用，请求体里不再带 tools 字段。
+    const cfg = buildAIRequest(env, targetModelId, sendMessages, useUpstreamStream, promptTools ? null : tools);
     if (cfg.error) return { error: cfg.error };
+    // 真实 prompt 体积（含工具定义）：AGENT_CONTEXT_BUDGET 只管消息，
+    // 不算这一项的话，运维看到的预算和实际发出去的 prompt 差着好几千字符
+    try { stats.promptChars = JSON.stringify(cfg.payload).length; } catch (e) {}
 
     let resp;
     try {
@@ -388,6 +431,12 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       if (nm === 'UpstreamSSEError') return { error: '上游返回错误：' + emsg };
       return { error: '网络错误：' + (emsg || String(e)) };
     }
+    // token 用量：上游回传就累加，不回传就保持 0（不估算，估算出来的数字更误导人）
+    if (msg && msg.usage) {
+      const u = msg.usage;
+      if (u.prompt_tokens > 0) stats.promptTokens += u.prompt_tokens;
+      if (u.completion_tokens > 0) stats.completionTokens += u.completion_tokens;
+    }
 
     if (msg.imageUrl) {
       return { text: '[🖼️ 点击查看生成的图片](' + msg.imageUrl + ')', usedTools: false, isImage: true, stopReason: 'image' };
@@ -427,18 +476,18 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return { text: clean, usedTools: step > 0, stopReason: 'done' };
     }
 
-    // 连续三次完全相同的调用：早就该停了，不必等到步数耗尽
+    // 连续三次完全相同的调用：早就该停了，不必等到步数耗尽。
+    // v7.9.0：只对「前两次都成功」的批次生效。失败后重试是最该鼓励的行为，
+    // 旧实现把三次失败的重试也判成「原地打转」，用户明明只是网络抖了一下。
     const stepSig = toolCalls.map(toolCallSignature).sort().join(';;');
-    const prev1 = recentBatchSigs.length >= 1 ? recentBatchSigs[recentBatchSigs.length - 1] : null;
-    const prev2 = recentBatchSigs.length >= 2 ? recentBatchSigs[recentBatchSigs.length - 2] : null;
-    if (prev1 === stepSig && prev2 === stepSig) {
+    const prev1 = recentBatches.length >= 1 ? recentBatches[recentBatches.length - 1] : null;
+    const prev2 = recentBatches.length >= 2 ? recentBatches[recentBatches.length - 2] : null;
+    if (prev1 && prev2 && prev1.sig === stepSig && prev2.sig === stepSig && !prev1.failed && !prev2.failed) {
       await rollbackStreamed(msg.forwarded);
       const prefix = stripDSMLBlocks(assistantText).trim();
       stats.stopReason = 'repeat';
       return { text: (prefix ? prefix + '\n\n' : '') + '（检测到重复调用同一工具，已停止以避免空转；请换个问法或补充信息后重试）', usedTools: true, stopReason: 'repeat' };
     }
-    recentBatchSigs.push(stepSig);
-    if (recentBatchSigs.length > 2) recentBatchSigs.shift();
 
     await rollbackStreamed(msg.forwarded);
 
@@ -490,20 +539,31 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
           }
           args = parsed;
         }
-        // 跨步重复调用：同一工具 + 同一参数本轮第 3 次起不再执行（结果必然一样）
+        // 跨步重复调用：同一工具 + 同一参数本轮「成功执行」第 3 次起不再执行（结果必然一样）。
+        // v7.9.0：只统计成功次数。旧实现执行前就 +1，失败也占一次名额 ——
+        // 网络抖一下、工具超时一次，模型重试两次就被判成「原地打转」直接跳过，
+        // 提示还写着「结果不会变化」，可对一次失败而言这是假话，用户什么都拿不到。
+        // 失败后重试恰恰是最该鼓励的行为，所以失败不计数、也不该触发熔断。
         const sig = toolCallSignature(tc);
-        if (!batchSigSeen.has(sig)) {
-          batchSigSeen.add(sig);
-          sigCount.set(sig, (sigCount.get(sig) || 0) + 1);
-        }
-        const times = sigCount.get(sig) || 1;
-        if (times >= REPEAT_SKIP_AT) {
+        const firstInBatch = !batchSigSeen.has(sig);
+        if (firstInBatch) batchSigSeen.add(sig);
+        const doneCount = sigSuccess.get(sig) || 0;
+        if (firstInBatch && doneCount >= REPEAT_STOP_AT - 1) {
           toolResults[idx] = {
             tc,
-            result: '（同一工具与相同参数本轮已调用 ' + (times - 1) + ' 次，结果不会变化，已跳过重复执行；请换关键词/工具，或直接基于已有结果作答）',
+            result: '（同一工具与相同参数本轮已成功执行 ' + doneCount + ' 次，结果不会变化，已跳过重复执行；请换关键词/工具，或直接基于已有结果作答）',
             failed: true,
             skipped: true,
-            hardStop: times >= REPEAT_STOP_AT
+            hardStop: true
+          };
+          continue;
+        }
+        if (firstInBatch && doneCount >= REPEAT_SKIP_AT - 1) {
+          toolResults[idx] = {
+            tc,
+            result: '（同一工具与相同参数本轮已成功执行 ' + doneCount + ' 次，结果不会变化，已跳过重复执行；请换关键词/工具，或直接基于已有结果作答）',
+            failed: true,
+            skipped: true
           };
           continue;
         }
@@ -513,6 +573,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
           stepDedup.set(sig, p);
         }
         const result = await p;
+        // 只有成功才算「这一次参数用过了」；失败留给模型重试的机会
+        if (firstInBatch && !isToolFailure(result)) sigSuccess.set(sig, doneCount + 1);
         // 分页类工具（web_fetch / read_doc）保留它们承诺的页大小，
         // 并在截断提示里直接写出续读用的 offset，省掉模型自己猜的那一步
         const paginated = fn.name === 'web_fetch' || fn.name === 'read_doc';
@@ -553,6 +615,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     stats.failed += stepFailed;
     stats.skipped += stepSkipped;
     totalFailed += stepFailed;
+    // 记录这一步的批次签名与「是否有失败」：失败批次不参与「连续三次相同即停」的判定
+    recentBatches.push({ sig: stepSig, failed: stepFailed > 0 });
+    if (recentBatches.length > 2) recentBatches.shift();
 
     // 整步没有任何新信息（全是重复调用 / 同样的缓存结果 / 同样的失败）
     if (toolResults.length && fresh === 0) noProgressStreak += 1;
