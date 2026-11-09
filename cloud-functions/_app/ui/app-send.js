@@ -218,7 +218,10 @@ export default `  async function sendMessage() {
             messages: reqSession.messages.slice(-MAX_SEND_MSGS),
             model: modelSelect.value,
             agent: agentMode,
-            session_id: reqSessionId
+            session_id: reqSessionId,
+            // v7.10.0：浏览器级记忆作用域（L2 情景 / L3 语义跨会话生效）。
+            // 老缓存页面没有这个变量时用空串，服务端会退回会话级作用域，不会报错。
+            client_id: (typeof clientId === 'string' ? clientId : '')
           }),
           signal: localAbortController.signal
         });

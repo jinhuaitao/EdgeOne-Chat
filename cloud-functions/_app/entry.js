@@ -28,6 +28,83 @@ import { HTML_CONTENT } from './ui/index.js';
 import { resolveStore, ensureProvisioned, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 import { kbPrefetch } from './kb/prefetch.js';
+import { agentGetMemories, formatSemanticBlock } from './agent/memory.js';
+import { getWorking, getEpisodes, pickRelevantEpisodes, formatLayeredMemory, memoryDiag,
+  recordTurnMemory } from './agent/memory-layers.js';
+
+// ==================== 普通对话模式的记忆写回 ====================
+// v7.10.1：旧实现只在这里「注入」记忆，却从不「写回」——于是 L1/L2 永远是空的，
+// 注入的那段代码等于白写，用户关掉 Agent 后聊一整天，`/memory` 里还是一片空白。
+// 这里用 tee() 把上游 SSE 分出一支旁路，边读边抽取正文，流结束后写回。
+// 三点约束：
+//   1) 只旁路、不改写：客户端拿到的字节与原来完全一致；
+//   2) 不阻塞：不 await，写回失败/超时都不影响已经发出去的答案；
+//   3) 只收正文：上限 6000 字符，足够抽出结论句，也不会为一段长回答占满内存。
+const MEM_MIRROR_MAX_CHARS = 6000;
+
+async function collectSseAssistantText(stream) {
+  const reader = stream.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line || line.charAt(0) === ':') continue;
+        if (line.indexOf('data:') !== 0) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const j = JSON.parse(data);
+          const ch = j && j.choices && j.choices[0];
+          const d = ch && (ch.delta || ch.message);
+          if (d && typeof d.content === 'string') text += d.content;
+        } catch (e) { /* 非 JSON 的心跳/注释行，忽略 */ }
+      }
+      if (text.length >= MEM_MIRROR_MAX_CHARS) {
+        text = text.slice(0, MEM_MIRROR_MAX_CHARS);
+        break;
+      }
+    }
+  } catch (e) {
+    // 上游中途断开：已经收到的部分照样写回（半截结论也比没有强）
+  }
+  try { await reader.cancel(); } catch (e) {}
+  return text;
+}
+
+// 旁路写回：调用方拿到响应后这里继续跑，不 await。
+function mirrorTurnToMemory(env, upstreamBody, meta) {
+  if (!upstreamBody || typeof upstreamBody.tee !== 'function') return upstreamBody;
+  let client = null;
+  let mirror = null;
+  try {
+    [client, mirror] = upstreamBody.tee();
+  } catch (e) {
+    return upstreamBody;
+  }
+  const job = (async () => {
+    const ai = await collectSseAssistantText(mirror);
+    if (!ai) return;
+    const timeout = new Promise(r => setTimeout(() => r({ ok: false, reason: 'timeout' }), 800));
+    await Promise.race([
+      recordTurnMemory(env, meta.sessionScope, {
+        userText: meta.userText,
+        assistantText: ai,
+      }, { episodeScope: meta.longScope }).catch(() => null),
+      timeout,
+    ]);
+  })();
+  // 显式吞掉异常：记忆是增强项，绝不能冒泡成未处理的 Promise 拒绝
+  job.catch(() => {});
+  return client;
+}
 
 // 取最后一条用户消息的纯文本（兼容多模态分片数组）。预检索用它当查询词。
 function pickLastUserText(messages) {
@@ -123,6 +200,9 @@ async function routeRequest(request, env, ctx) {
         // v7.5.0：Agent 每轮统计（步数 / 工具数 / 失败数 / 缓存命中 / 停止原因）。
         // 只反映「处理这个请求的实例」，跨实例看全量请用控制台日志。
         try { debug.agent = agentTurnStats(); } catch (e) {}
+        // v7.10.0：三层记忆的实例内计数（写回次数 / 召回次数 / 写失败）。
+        // 记忆是「悄悄生效」的功能，没有这几个数就完全没法判断它到底有没有在工作。
+        try { debug.memory = memoryDiag(); } catch (e) {}
         payload.debug = debug;
       }
       return new Response(JSON.stringify(payload), { headers: HEALTH_HEADERS });
@@ -178,26 +258,63 @@ async function routeRequest(request, env, ctx) {
         // v7.8.0：页面上不再有「📚 知识库」开关，知识库恒定开启（这正是用户要的默认行为）。
         // 保留 kb_first=false 只是给外部调用方/旧缓存页面留的逃生口，页面本身已不再发送；
         // 运维级关闭用 WEB_KB_FIRST=0。
+        // v7.10.0：同一个位置再注入三层记忆。旧实现普通对话模式完全不带记忆，
+        // 用户一说「刚才说的那个」就断片；现在把 L1 要点 / L2 相关历史 / L3 长期事实
+        // 合成一段 system 前缀（≤1500 字符），和知识库片段一起下发。
+        const injectParts = [];
+        const lastUserText = pickLastUserText(body.messages);
+        // v7.10.1：session_id 缺失时不再兜底成 'web_default'。
+        // 兜底的后果是所有不带 session_id 的请求共用一份 L1 工作记忆——
+        // 外部调用方 A 的对话要点会出现在调用方 B 的提示词里。
+        // 现在没有会话标识就退回浏览器作用域（有 client_id）或干脆不读写 L1。
+        const rawSid = String(body.session_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+        const webCid = String(body.client_id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+        // L1 跟会话走、L2/L3 跟浏览器走（与 web-agent.js 同一套作用域规则）
+        const longScope = webCid ? ('webu_' + webCid) : (rawSid ? 'web_' + rawSid : '');
+        const sessionScope = rawSid ? ('web_' + rawSid) : longScope;
+        const memoryOn = !isImageAPI && String(env.WEB_MEMORY || '1') !== '0' && !!longScope;
+
+        if (memoryOn) {
+          try {
+            const [mems, work, eps] = await Promise.all([
+              agentGetMemories(env, longScope).catch(() => []),
+              sessionScope ? getWorking(env, sessionScope).catch(() => null) : Promise.resolve(null),
+              getEpisodes(env, longScope).catch(() => []),
+            ]);
+            const memText = formatSemanticBlock(mems, lastUserText, 900);
+            const layered = formatLayeredMemory({
+              work: work,
+              episodes: pickRelevantEpisodes(eps, lastUserText, 2),
+            }, { budget: 700 }).text;
+            const merged = [layered, memText].filter(Boolean).join('\n\n');
+            if (merged) injectParts.push(merged);
+          } catch (e) {
+            // 记忆注入失败不影响正常对话
+          }
+        }
+
         if (!isImageAPI && body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0') {
           try {
-            const lastUserText = pickLastUserText(body.messages);
             const pre = await kbPrefetch(env, lastUserText, {
               budgetMs: parseInt(env.WEB_KB_PREFETCH_MS || '', 10) > 0
                 ? Math.min(parseInt(env.WEB_KB_PREFETCH_MS, 10), 6000)
                 : 2200,
               topN: 2,
             });
-            if (pre && pre.ok && pre.text) {
-              const first = payload.messages[0];
-              if (first && first.role === 'system') {
-                // 前端自带 system 时合并，避免出现两条 system（部分上游会整单 400）
-                payload.messages[0] = { role: 'system', content: String(first.content || '') + '\n\n' + pre.text };
-              } else {
-                payload.messages = [{ role: 'system', content: pre.text }].concat(payload.messages);
-              }
-            }
+            if (pre && pre.ok && pre.text) injectParts.push(pre.text);
           } catch (e) {
             // 预检索失败绝不能影响正常对话：静默降级为「不带知识库回答」
+          }
+        }
+
+        if (injectParts.length) {
+          const injected = injectParts.join('\n\n');
+          const first = payload.messages[0];
+          if (first && first.role === 'system') {
+            // 前端自带 system 时合并，避免出现两条 system（部分上游会整单 400）
+            payload.messages[0] = { role: 'system', content: String(first.content || '') + '\n\n' + injected };
+          } else {
+            payload.messages = [{ role: 'system', content: injected }].concat(payload.messages);
           }
         }
 
@@ -216,7 +333,16 @@ async function routeRequest(request, env, ctx) {
         }
 
         if (!isImageAPI) {
-          return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
+          // v7.10.1：普通对话模式也写回记忆。旁路 tee 不改变发给客户端的字节，
+          // 写回在后台进行，失败/超时都不影响这一轮回答。
+          const outBody = memoryOn
+            ? mirrorTurnToMemory(env, upstreamResponse.body, {
+              userText: lastUserText,
+              sessionScope: sessionScope,
+              longScope: longScope,
+            })
+            : upstreamResponse.body;
+          return new Response(outBody, { headers: SSE_HEADERS });
         } else {
           return await buildImageSseResponse(env, upstreamResponse);
         }

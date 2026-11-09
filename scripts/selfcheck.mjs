@@ -1951,18 +1951,18 @@ async function main() {
     }
   });
 
-  console.log('\n=== 13. Agent 性能加速与 20 项零密钥工具自检 ===');
+  console.log('\n=== 13. Agent 性能加速与 21 项零密钥工具自检 ===');
 
   const agentToolsMod = await import('../cloud-functions/_app/agent/tools.js');
   const toolsLocalMod = await import('../cloud-functions/_app/agent/tools-local.js');
   const toolsWebMod = await import('../cloud-functions/_app/agent/tools-web.js');
   const limitsMod = await import('../cloud-functions/_app/agent/limits.js');
 
-  await checkAsync('Agent 工具箱共注册 20 项工具（Web 只读模式自动过滤 4 项写入工具剩 16 项）', () => {
+  await checkAsync('Agent 工具箱共注册 21 项工具（Web 只读模式自动过滤 4 项写入工具剩 17 项）', () => {
     const allTools = agentToolsMod.getAgentTools(false);
     const roTools = agentToolsMod.getAgentTools(true);
-    assert.equal(allTools.length, 20);
-    assert.equal(roTools.length, 16);
+    assert.equal(allTools.length, 21);
+    assert.equal(roTools.length, 17);
     const names = allTools.map(t => t.function.name);
     for (const expected of ['unit_convert', 'text_toolkit', 'network_lookup', 'github_lookup', 'arxiv_search', 'trending_news']) {
       assert.ok(names.includes(expected), '应包含新工具 ' + expected);
@@ -2974,7 +2974,7 @@ async function main() {
     assert.equal(countIn(without), 45, '没有预检索时标题列表仍是主要线索，不截断');
   });
 
-  await checkAsync('20 项工具定义总体积受控（≤ 7800 字符，避免每步白烧 token）', () => {
+  await checkAsync('21 项工具定义总体积受控（≤ 7800 字符，避免每步白烧 token）', () => {
     const size = JSON.stringify(agentToolsMod.getAgentTools(false)).length;
     assert.ok(size <= 7800, '实际 ' + size + ' 字符');
   });
@@ -3071,6 +3071,525 @@ async function main() {
     assert.equal('temperature' in p3, false, '推理模型不传 temperature');
     const p4 = agentChannelMod.buildAIRequest(Object.assign({}, base, { MAX_TOKENS: 'abc' }), 'm1', msgs, false, null).payload;
     assert.equal(p4.max_tokens, 4096, '非法 MAX_TOKENS 应回退到文档写明的 4096');
+  });
+
+  console.log('\n=== 19. 三层记忆（L1 工作 / L2 情景 / L3 语义） ===');
+  const memLayers = await import('../cloud-functions/_app/agent/memory-layers.js');
+  const memMod = await import('../cloud-functions/_app/agent/memory.js');
+  const memEnv = { R2: blobBackend.makeBlobBackend(fakeBlobStore()) };
+
+  check('摘要提炼：结论句优先、长度受控、主题词过滤停用词', () => {
+    const d = memLayers.digestTurn({
+      userText: '帮我对比一下甲骨文云和腾讯云的 ARM 免费额度，哪个更适合长期跑小服务？',
+      assistantText: '结论：腾讯云的免费额度更稳，甲骨文云更容易被回收。后面还有很长的解释。'.repeat(20),
+    });
+    assert.ok(d.user.length <= 121, '用户句应截断');
+    assert.ok(d.ai.length <= 170, '结论句应截断');
+    assert.equal(d.ai.startsWith('结论：'), true, '应优先取第一句结论');
+    assert.ok(d.topics.length > 0, '应抽到主题词');
+    for (const bad of ['什么', '可以', '我们', '一下', '帮我', 'the', 'and']) {
+      assert.equal(d.topics.includes(bad), false, '停用词不该进主题：' + bad);
+    }
+    for (const t of d.topics) {
+      assert.ok((d.user + d.ai).toLowerCase().includes(t), '主题词必须真的出现在原文里：' + t);
+    }
+  });
+
+  check('实质性判定：闲聊不记情景记忆，调过工具/存过文档/长回答才记', () => {
+    assert.equal(memLayers.shouldRecordEpisode({ user: '你好', ai: '你好呀' }), false);
+    assert.equal(memLayers.shouldRecordEpisode({ user: '谢谢', ai: '不客气' }), false);
+    assert.equal(memLayers.shouldRecordEpisode({ user: '继续', ai: '好' }), false);
+    assert.equal(memLayers.shouldRecordEpisode({ user: '查一下', ai: '好', tools: ['web_search'] }), true);
+    assert.equal(memLayers.shouldRecordEpisode({ user: '存起来', ai: '好', docs: ['部署笔记'] }), true);
+    assert.equal(memLayers.shouldRecordEpisode({ user: '帮我分析一下这个方案在成本、运维复杂度和长期风险上的取舍', ai: '略' }), true);
+  });
+
+  await checkAsync('L1 工作记忆：追加轮次 / 主题最新优先 / 未完成事项 / 超限淘汰', async () => {
+    const cid = 'mem_l1';
+    for (let i = 1; i <= 3; i++) {
+      await memLayers.appendWorkingTurn(memEnv, cid, {
+        ts: Date.now() + i,
+        user: '第' + i + '个问题：部署配置怎么改',
+        ai: '结论' + i,
+        topics: i === 3 ? ['部署配置', '回源'] : ['部署配置'],
+        pending: i === 3,
+      });
+    }
+    const w = await memLayers.getWorking(memEnv, cid);
+    assert.equal(w.turns.length, 3);
+    assert.equal(w.topics[0], '部署配置', '最新主题排最前');
+    assert.equal(w.openTasks.length, 1);
+    assert.match(w.openTasks[0], /第3个问题/);
+
+    const tightEnv = Object.assign({}, memEnv, { MEMORY_WORK_TURNS: '2' });
+    for (let i = 4; i <= 6; i++) {
+      await memLayers.appendWorkingTurn(tightEnv, cid, { user: 'q' + i, ai: 'a' + i, topics: [] });
+    }
+    const w2 = await memLayers.getWorking(tightEnv, cid);
+    assert.equal(w2.turns.length, 2, 'MEMORY_WORK_TURNS=2 时只保留最近 2 轮');
+    assert.equal(w2.turns[1].user, 'q6');
+  });
+
+  await checkAsync('L1 过期自动翻篇：超过 24 小时清空轮次，但保留主题', async () => {
+    const cid = 'mem_l1_ttl';
+    await r2.storePut(memEnv, memLayers.workKey(cid), JSON.stringify({
+      v: 1, scope: cid,
+      startedAt: Date.now() - 3 * 86400000,
+      updatedAt: Date.now() - 2 * 86400000,
+      turns: [{ ts: Date.now() - 2 * 86400000, user: '旧问题', ai: '旧结论', topics: ['旧主题'] }],
+      topics: ['旧主题'], openTasks: ['旧待办'],
+    }));
+    const w = await memLayers.getWorking(memEnv, cid);
+    assert.equal(w.turns.length, 0, '超过 24 小时应视为新会话');
+    assert.deepEqual(w.topics, ['旧主题'], '主题保留，便于「上次聊到哪」');
+    assert.equal(w.openTasks.length, 0, '旧待办不该缠着今天');
+  });
+
+  await checkAsync('L2 情景记忆：同主题 20 分钟内合并成一条（一句一条等于没记忆）', async () => {
+    const cid = 'mem_l2';
+    await memLayers.appendEpisode(memEnv, cid, {
+      ts: Date.now() - 1000,
+      user: '甲骨文云 ARM 免费额度是多少',
+      ai: '每月 4 核 24G',
+      topics: ['甲骨文', '免费额度'],
+    });
+    await memLayers.appendEpisode(memEnv, cid, {
+      ts: Date.now(),
+      user: '甲骨文云 ARM 怎么开机',
+      ai: '先创建实例再放行端口',
+      topics: ['甲骨文', '免费额度'],
+    });
+    const eps = await memLayers.getEpisodes(memEnv, cid);
+    assert.equal(eps.length, 1, '同主题应合并');
+    assert.equal(eps[0].turns, 2);
+    assert.match(eps[0].summary, /先创建实例/);
+  });
+
+  await checkAsync('L2 容量上限：MEMORY_EPISODE_MAX 生效，只留最近的', async () => {
+    const cid = 'mem_l2_cap';
+    const env2 = Object.assign({}, memEnv, { MEMORY_EPISODE_MAX: '10' });
+    for (let i = 0; i < 12; i++) {
+      await memLayers.appendEpisode(env2, cid, {
+        ts: Date.now() + i * 1000,
+        user: '话题' + i + '的讨论内容',
+        ai: '结论' + i,
+        topics: ['话题' + i],
+      });
+    }
+    const eps = await memLayers.getEpisodes(env2, cid);
+    assert.equal(eps.length, 10, '应只保留 10 条');
+    assert.equal(eps[eps.length - 1].summary, '结论11', '最新的必须还在');
+  });
+
+  await checkAsync('L2 按关键词删除：只删命中的条目', async () => {
+    const cid = 'mem_l2_del';
+    await memLayers.appendEpisode(memEnv, cid, { ts: Date.now() - 5000, user: '讨论猫粮品牌', ai: '推荐 A 牌', topics: ['猫粮'] });
+    await memLayers.appendEpisode(memEnv, cid, { ts: Date.now(), user: '讨论服务器选型', ai: '选 2C4G', topics: ['服务器'] });
+    const rr = await memLayers.forgetEpisodes(memEnv, cid, '猫粮');
+    assert.equal(rr.removed, 1);
+    const left = await memLayers.getEpisodes(memEnv, cid);
+    assert.equal(left.length, 1);
+    assert.match(left[0].title, /服务器/);
+  });
+
+  await checkAsync('跨层召回：三层同时命中并带层标签；查不到时如实说没有', async () => {
+    const cid = 'mem_recall';
+    await memLayers.appendWorkingTurn(memEnv, cid, { user: '甲骨文云怎么注册', ai: '需要信用卡验证', topics: ['甲骨文'] });
+    await memLayers.appendEpisode(memEnv, cid, {
+      ts: Date.now() - 86400000,
+      user: '甲骨文云 ARM 额度',
+      ai: '每月 4 核 24G',
+      topics: ['甲骨文', '额度'],
+    });
+    await memMod.agentSaveMemory(memEnv, cid, '我的云服务主要用甲骨文云', { kind: 'project', tags: ['云'] });
+
+    const r = await memLayers.recallMemory(memEnv, cid, '甲骨文云');
+    assert.equal(r.ok, true);
+    assert.ok(r.work && r.work.turns.length >= 1, 'L1 应命中');
+    assert.ok(r.episodes.length >= 1, 'L2 应命中');
+    assert.ok(r.semantic.length >= 1, 'L3 应命中');
+    const txt = memLayers.formatRecallResult(r);
+    assert.match(txt, /【L1 工作记忆】/);
+    assert.match(txt, /【L2 情景记忆】/);
+    assert.match(txt, /【L3 语义记忆】/);
+    assert.match(txt, /项目：/, '语义记忆应带类型标签');
+
+    const none = await memLayers.recallMemory(memEnv, 'mem_none_at_all', '完全不存在的话题xyz');
+    assert.equal(none.ok, false);
+    assert.match(memLayers.formatRecallResult(none), /都没有与/);
+  });
+
+  await checkAsync('相关性过滤：刚写入但完全不相关的内容不算「相关」', async () => {
+    const cid = 'mem_rel';
+    await memMod.agentSaveMemory(memEnv, cid, '我住在杭州');
+    await memLayers.appendEpisode(memEnv, cid, { ts: Date.now(), user: '讨论今晚吃什么', ai: '吃火锅', topics: ['晚饭'] });
+    const r = await memLayers.recallMemory(memEnv, cid, '量子色动力学');
+    assert.equal(r.semantic.length, 0, '语义记忆不该被新近度混进来');
+    assert.equal(r.episodes.length, 0, '情景记忆同样不该');
+    assert.equal(r.ok, false);
+    const hit = await memMod.agentSearchMemories(memEnv, cid, '杭州');
+    assert.equal(hit.length, 1, '命中的那条要能查到');
+  });
+
+  await checkAsync('L1+L2 注入文本受预算约束（不会把用户问题挤到看不见的位置）', () => {
+    const work = {
+      updatedAt: Date.now(),
+      turns: Array.from({ length: 12 }, () => ({ ts: Date.now(), user: '问题'.repeat(20), ai: '结论'.repeat(20) })),
+      topics: ['部署', '回源'], openTasks: ['还没定方案'],
+    };
+    const episodes = Array.from({ length: 5 }, (_, i) => ({
+      ts: Date.now() - i * 86400000, title: '标题' + i, summary: '摘要'.repeat(80), topics: [],
+    }));
+    const out = memLayers.formatLayeredMemory({ work: work, episodes: episodes }, { budget: 600 });
+    assert.ok(out.chars <= 800, '预算 600 时实际 ' + out.chars + ' 字符');
+    assert.match(out.text, /【L1 会话工作记忆】/);
+    assert.match(out.text, /【L2 相关情景记忆】/);
+    const empty = memLayers.formatLayeredMemory(null, {});
+    assert.equal(empty.text, '', '没有记忆时不该产出空标题');
+  });
+
+  check('系统提示词：注入 L1/L2、语义记忆带类型、说明三层优先级', () => {
+    const p = promptMod.buildAgentSystemPrompt(
+      [{ fact: '我住在杭州', ts: Date.now(), kind: 'profile' }],
+      '杭州今天天气',
+      [],
+      true,
+      '',
+      {
+        work: { updatedAt: Date.now(), turns: [{ ts: Date.now(), user: '部署问题', ai: '用容器方案' }], topics: ['部署'], openTasks: [] },
+        episodes: [{ ts: Date.now() - 86400000, title: '上次聊的部署方案', summary: '最终选了容器', topics: [] }],
+      }
+    );
+    assert.match(p, /【L1 会话工作记忆】/);
+    assert.match(p, /【L2 相关情景记忆】/);
+    assert.match(p, /【关于用户的长期记忆】/);
+    assert.match(p, /［画像］/, '语义记忆应按类型标注');
+    assert.match(p, /三层记忆的边界/, '必须说明三层冲突时以谁为准');
+    assert.match(p, /不要假装记得/, '没有记录时必须承认，而不是编一段');
+
+    const bare = promptMod.buildAgentSystemPrompt([], '你好', [], true, '', null);
+    assert.equal(/【L1 会话工作记忆】/.test(bare), false, '没有工作记忆时不该出现空段落');
+    assert.equal(/【L2 相关情景记忆】/.test(bare), false);
+  });
+
+  await checkAsync('L3 语义记忆：kind/tags 持久化，非法 kind 归一为 fact', async () => {
+    const cid = 'mem_l3';
+    await memMod.agentSaveMemory(memEnv, cid, '我偏好简洁的回答', { kind: 'preference', tags: ['风格', '回答'] });
+    await memMod.agentSaveMemory(memEnv, cid, '我住在杭州', { kind: '不存在的类型' });
+    const arr = await memMod.agentGetMemories(memEnv, cid);
+    const pref = arr.find(m => /偏好简洁/.test(m.fact));
+    assert.equal(pref.kind, 'preference');
+    assert.deepEqual(pref.tags, ['风格', '回答']);
+    assert.equal(arr.find(m => /杭州/.test(m.fact)).kind, 'fact', '非法 kind 必须回退 fact');
+  });
+
+  await checkAsync('L3 容量淘汰：MEMORY_ITEM_MAX 生效，新条目优先保留', async () => {
+    const cid = 'mem_l3_cap';
+    const env3 = Object.assign({}, memEnv, { MEMORY_ITEM_MAX: '20' });
+    for (let i = 0; i < 25; i++) await memMod.agentSaveMemory(env3, cid, '事实编号' + i + '的记录内容');
+    const arr = await memMod.agentGetMemories(env3, cid);
+    assert.equal(arr.length, 20, '应被压到 20 条');
+    assert.ok(arr.some(m => /事实编号24/.test(m.fact)), '最新一条必须保留');
+    assert.equal(arr.some(m => /事实编号0的记录/.test(m.fact)), false, '最旧的一条应被淘汰');
+  });
+
+  await checkAsync('L3 检索按相关性排序；显式召回会累加使用度', async () => {
+    const cid = 'mem_l3_search';
+    await memMod.agentSaveMemory(memEnv, cid, '我常用 Python 写脚本');
+    await memMod.agentSaveMemory(memEnv, cid, '我养了一只猫叫汤圆');
+    const r1 = await memMod.agentSearchMemories(memEnv, cid, 'Python 脚本');
+    assert.match(r1[0].fact, /Python/);
+    await memMod.agentTouchMemories(memEnv, cid, ['我养了一只猫叫汤圆']);
+    const arr = await memMod.agentGetMemories(memEnv, cid);
+    assert.ok(arr.find(m => /猫/.test(m.fact)).hits >= 1, '用过就该记一次');
+    const st = await memMod.agentMemStats(memEnv, cid);
+    assert.equal(st.count, 2);
+    assert.ok(st.chars > 0);
+  });
+
+  check('recall_memory 已注册；Web 只读模式保留检索、仍禁写入', () => {
+    const all = agentToolsMod.getAgentTools(false).map(t => t.function.name);
+    const ro = agentToolsMod.getAgentTools(true).map(t => t.function.name);
+    assert.ok(all.includes('recall_memory'));
+    assert.ok(ro.includes('recall_memory'), 'Web 必须能检索记忆');
+    assert.equal(ro.includes('remember'), false, 'Web 仍不能写长期事实');
+    assert.equal(ro.includes('forget_memory'), false);
+    const rp = agentToolsMod.getAgentTools(false).find(t => t.function.name === 'remember');
+    assert.ok(rp.function.parameters.properties.kind, 'remember 应支持 kind');
+    assert.ok(rp.function.parameters.properties.tags, 'remember 应支持 tags');
+    const fp = agentToolsMod.getAgentTools(false).find(t => t.function.name === 'forget_memory');
+    assert.ok(fp.function.parameters.properties.layer, 'forget_memory 应支持分层');
+  });
+
+  await checkAsync('Web 端即使模型幻觉出 remember 也不执行，recall_memory 正常可用', async () => {
+    const blocked = await agentToolsMod.execAgentTool('remember', { fact: 'x' }, memEnv, 'web_guard', true);
+    assert.match(blocked, /不可用/);
+    const ok = await agentToolsMod.execAgentTool('recall_memory', { query: '甲骨文云' }, memEnv, 'mem_recall', true);
+    assert.match(ok, /L1|L2|L3/, '应返回三层内容');
+  });
+
+  await checkAsync('forget_memory 分层：layer=all 同时删情景与语义', async () => {
+    const cid = 'mem_forget';
+    await memMod.agentSaveMemory(memEnv, cid, '我的测试项目叫天河');
+    await memLayers.appendEpisode(memEnv, cid, { user: '天河项目进展如何', ai: '已完成第一阶段', topics: ['天河项目'] });
+    const msg = await agentToolsMod.execAgentTool('forget_memory', { keyword: '天河', layer: 'all' }, memEnv, cid, false);
+    assert.match(msg, /长期事实/);
+    assert.match(msg, /情景记忆/);
+    assert.equal((await memMod.agentGetMemories(memEnv, cid)).length, 0);
+    assert.equal((await memLayers.getEpisodes(memEnv, cid)).length, 0);
+  });
+
+  await checkAsync('recordTurnMemory：一次写回 L1 + L2，闲聊只写 L1', async () => {
+    const cid = 'mem_rec';
+    const r = await memLayers.recordTurnMemory(memEnv, cid, {
+      userText: '帮我把部署脚本改成容器方案，顺便说明迁移步骤',
+      assistantText: '结论：先改 Dockerfile，再迁移数据。',
+      tools: ['web_search'],
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.work, true);
+    assert.equal(r.episode, true);
+    assert.equal((await memLayers.getWorking(memEnv, cid)).turns.length, 1);
+    assert.equal((await memLayers.getEpisodes(memEnv, cid)).length, 1);
+
+    const r2 = await memLayers.recordTurnMemory(memEnv, cid, { userText: '谢谢', assistantText: '不客气' });
+    assert.equal(r2.work, true);
+    assert.equal(r2.episode, false, '闲聊不该产生情景记忆');
+  });
+
+  await checkAsync('clearWorking 只清 L1：L2/L3 保留（换话题不等于失忆）', async () => {
+    const cid = 'mem_clear';
+    await memLayers.recordTurnMemory(memEnv, cid, {
+      userText: '帮我把部署步骤写成文档，越清楚越好',
+      assistantText: '结论：已整理成四步。',
+      tools: ['save_doc'],
+      docs: ['部署步骤'],
+    });
+    await memMod.agentSaveMemory(memEnv, cid, '我的项目代号是白鹭');
+    await memLayers.clearWorking(memEnv, cid);
+    assert.equal(await memLayers.getWorking(memEnv, cid), null, 'L1 应被清空');
+    assert.ok((await memLayers.getEpisodes(memEnv, cid)).length >= 1, 'L2 必须保留');
+    assert.equal((await memMod.agentGetMemories(memEnv, cid)).length, 1, 'L3 必须保留');
+  });
+
+  await checkAsync('/memory 三层报告：分层展示 + 引导命令', async () => {
+    const txt = await memLayers.memoryReport(memEnv, 'mem_recall');
+    assert.match(txt, /【L1 工作记忆】/);
+    assert.match(txt, /【L2 情景记忆】/);
+    assert.match(txt, /【L3 语义记忆】/);
+    assert.match(txt, /\/recall/, '应告诉用户怎么检索');
+    const st = await memLayers.memoryStats(memEnv, 'mem_recall');
+    assert.ok(st.workTurns >= 1);
+    assert.ok(st.episodes >= 1);
+    assert.ok(st.semantic >= 1);
+  });
+
+  await checkAsync('关闭开关：MEMORY_LAYERS=0 停 L1/L2；MEMORY_AUTO_WRITE=0 只读不写；无存储安全返回', async () => {
+    const offEnv = Object.assign({}, memEnv, { MEMORY_LAYERS: '0' });
+    const r = await memLayers.recordTurnMemory(offEnv, 'mem_off', { userText: '问题', assistantText: '答案' });
+    assert.equal(r.reason, 'disabled');
+    assert.equal(await memLayers.getWorking(offEnv, 'mem_off'), null);
+    const rec = await memLayers.recallMemory(offEnv, 'mem_off', '问题');
+    assert.equal(rec.ok, false);
+
+    const noWrite = await memLayers.recordTurnMemory(Object.assign({}, memEnv, { MEMORY_AUTO_WRITE: '0' }), 'mem_off', { userText: '问题', assistantText: '答案' });
+    assert.equal(noWrite.reason, 'disabled');
+
+    const noStore = await memLayers.recordTurnMemory({}, 'mem_off', { userText: '问题', assistantText: '答案' });
+    assert.equal(noStore.reason, 'no_store');
+  });
+
+  await checkAsync('Web 普通对话（Agent 关闭）：记忆按 client_id 跨会话注入', async () => {
+    const env = Object.assign({}, webKbEnv, { WEB_MEMORY: '1', WEB_KB_FIRST: '0' });
+    await memMod.agentSaveMemory(env, 'webu_c_test1234', '我是做边缘计算运维的，常用 Python', { kind: 'profile' });
+    await memLayers.appendWorkingTurn(env, 'web_session_abc', {
+      user: '刚才在讨论回源超时', ai: '结论：把超时调到 30 秒', topics: ['回源超时'],
+    });
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '我常用什么语言写脚本' }],
+      model: 'm1', agent: false, session_id: 'session_abc', client_id: 'c_test1234',
+    }, env);
+    const sys = String((captured.messages[0] || {}).content || '');
+    assert.equal(captured.messages[0].role, 'system');
+    assert.match(sys, /【关于用户的长期记忆】/);
+    assert.match(sys, /Python/);
+    assert.match(sys, /【L1 会话工作记忆】/, '工作记忆应按 session_id 注入');
+    assert.equal(captured.messages[1].role, 'user', '用户消息不能被顶掉');
+  });
+
+  await checkAsync('Web：L1 写会话作用域、L2 写浏览器作用域（换个新对话仍记得上次）', async () => {
+    const r = await memLayers.recordTurnMemory(memEnv, 'web_s1', {
+      userText: '帮我把这个服务的部署方式改成容器，并说明回滚步骤',
+      assistantText: '结论：用 Docker Compose 部署，回滚直接切回上一个镜像。',
+      tools: ['web_search'],
+    }, { episodeScope: 'webu_browser1' });
+    assert.equal(r.episode, true);
+    assert.equal((await memLayers.getWorking(memEnv, 'web_s1')).turns.length, 1, 'L1 应在会话作用域');
+    assert.equal((await memLayers.getEpisodes(memEnv, 'web_s1')).length, 0, '会话作用域不该有情景记忆');
+    assert.equal((await memLayers.getEpisodes(memEnv, 'webu_browser1')).length, 1, 'L2 应在浏览器作用域');
+  });
+
+  await checkAsync('Web Agent：recall_memory 走记忆作用域（webu_）而不是会话 id', async () => {
+    const env = loopEnv({ AGENT_MAX_STEPS: '3', MEMORY_LAYERS: '1' });
+    env.R2 = memEnv.R2;
+    await memMod.agentSaveMemory(env, 'webu_scope9', '我习惯用 Docker Compose 部署');
+    let calls = 0;
+    let toolMsg = '';
+    const prev = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      if (calls === 1) return sseFromEvents([toolCallEvent('c1', 'recall_memory', '{"query":"部署"}')]);
+      const body = JSON.parse(init.body);
+      const toolTurn = body.messages.filter(m => m.role === 'tool').pop();
+      if (toolTurn) toolMsg = String(toolTurn.content);
+      return sseFromEvents([deltaEvent({ content: '你习惯用 Docker Compose 部署。' })]);
+    };
+    try {
+      const r = await loopMod.tgAgentChat(env, () => Promise.resolve({ ok: true }), 'web_session9', 'm1',
+        [{ role: 'user', content: '我平时怎么部署服务？' }], true, null,
+        { kbReadOnly: true, memoryScope: 'webu_scope9', memoryRead: true, maxRuntimeMs: 30000 });
+      assert.match(r.text, /Docker Compose/);
+      assert.match(toolMsg, /Docker Compose/, '工具应查到浏览器作用域里的记忆');
+    } finally {
+      globalThis.fetch = prev;
+    }
+  });
+
+  // ---------- v7.10.1 回归用例：这五条都是「曾经真的错」的地方，不是纸面假设 ----------
+
+  await checkAsync('空作用域不兜底成 default：拿不到 chatId 就宁可不记忆，也不串号', async () => {
+    assert.equal(memLayers.memScope(''), '');
+    assert.equal(memLayers.memScope(null), '');
+    assert.equal(memLayers.workKey(''), '', '空作用域不能生成 kb/work/.json 这种共享 key');
+    assert.equal(memLayers.epiKey(''), '');
+    assert.equal(await memLayers.appendWorkingTurn(memEnv, '', { user: '匿名 A 的私密问题', ai: '结论' }), false);
+    assert.equal(await memLayers.getWorking(memEnv, ''), null);
+    assert.deepEqual(await memLayers.getEpisodes(memEnv, ''), []);
+    assert.equal(await memLayers.appendEpisode(memEnv, '', { user: 'x', ai: 'y', topics: ['z'] }), false);
+    assert.deepEqual(await memLayers.forgetEpisodes(memEnv, '', 'x'), { removed: 0 });
+    assert.equal(await r2.storeGet(memEnv, 'kb/work/.json'), null, '绝不能真的写出共享文件');
+    // 有正常作用域时功能不受影响
+    assert.equal(await memLayers.appendWorkingTurn(memEnv, 'anon_ok', { user: '正常用户', ai: '结论' }), true);
+  });
+
+  check('时间统一按北京时间渲染：不会出现「当前时间 10:03 / 记忆里 02:03」的矛盾', () => {
+    const p = memLayers.memTimeParts(Date.UTC(2026, 0, 1, 0, 0, 0));
+    assert.equal(p.hh, '08', 'UTC 零点应是北京时间 08 点');
+    assert.equal(p.m, '01');
+    assert.equal(p.d, '01');
+    const p2 = memLayers.memTimeParts(Date.UTC(2026, 0, 1, 16, 30, 0));
+    assert.equal(p2.hh, '00', 'UTC 16:30 是北京时间次日 00:30');
+    assert.equal(p2.d, '02', '跨日要跟着时区走');
+  });
+
+  await checkAsync('L2 合并保留最新结论：不会「时间是最新的、内容是最旧的」', async () => {
+    const cid = 'mem_l2_merge_tail';
+    const base = Date.now();
+    for (let i = 1; i <= 5; i++) {
+      await memLayers.appendEpisode(memEnv, cid, {
+        ts: base + i * 1000,
+        user: '第' + i + '次讨论部署方案',
+        ai: '第' + i + '轮结论：先灰度再全量，回滚切上一个镜像。',
+        topics: ['部署方案'],
+      });
+    }
+    const eps = await memLayers.getEpisodes(memEnv, cid);
+    assert.equal(eps.length, 1, '同主题应合并成一条');
+    assert.match(eps[0].summary, /第5轮结论/, '合并后必须留下最新一轮的结论');
+    assert.match(eps[0].summary, /第1轮结论/, '也要保留最早那条的结论，不能只剩最新');
+    assert.ok(eps[0].summary.length <= 320, '合并后长度仍受控');
+  });
+
+  check('注入预算是硬上限：MEMORY_INJECT_CHARS 调到 400 也不会超', () => {
+    const work = {
+      turns: Array.from({ length: 5 }, (_, i) => ({
+        ts: Date.now(), user: '问题'.repeat(30) + i, ai: '结论'.repeat(30),
+      })),
+      topics: ['甲', '乙'], openTasks: ['待办一'], updatedAt: Date.now(),
+    };
+    const eps = Array.from({ length: 5 }, (_, i) => ({
+      ts: Date.now(), title: '标题' + i, summary: '摘要'.repeat(80),
+    }));
+    const r = memLayers.formatLayeredMemory({ work, episodes: eps }, { budget: 400 });
+    assert.ok(r.chars <= 400, '实际 ' + r.chars + ' 字符超过预算 400');
+    assert.ok(r.text.length > 0, '预算内仍应注入 L1');
+    // 预算太小时宁可不注入 L2，也不要塞半句话
+    const tiny = memLayers.formatLayeredMemory({ work, episodes: eps }, { budget: 120 });
+    assert.ok(tiny.chars <= 120, '小预算同样要守住');
+  });
+
+  await checkAsync('/memory 报的是真实条数：超过 30 条也不会把「共 35 条」说成「共 30 条」', async () => {
+    const cid = 'mem_report_count';
+    for (let i = 1; i <= 35; i++) {
+      await memMod.agentSaveMemory(memEnv, cid, '测试事实编号' + i + '：值' + i);
+    }
+    const rep = await memLayers.memoryReport(memEnv, cid);
+    assert.match(rep, /【L3 语义记忆】共 35 条/, '条数必须来自真实统计，不是检索上限');
+    assert.match(rep, /其余 5 条/, '「其余 N 条」也要按真实总数算');
+  });
+
+  await checkAsync('普通对话模式（Agent 关闭）也会写回记忆，不再只读不写', async () => {
+    const env = Object.assign({}, webKbEnv, { WEB_MEMORY: '1', WEB_KB_FIRST: '0' });
+    const prev = globalThis.fetch;
+    globalThis.fetch = async () => new Response(
+      'data: {"choices":[{"delta":{"content":"结论：把回源超时改成 30 秒，并加上两次重试。"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"content":"这样可以避免边缘节点回源抖动直接打到用户。"}}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    let res;
+    try {
+      res = await mod.routeRequest(new Request('https://example.com/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: '这个服务的回源超时应该设多少，顺便说下重试策略怎么配' }],
+          model: 'm1', agent: false, session_id: 'wsmem1', client_id: 'cmem1',
+        }),
+      }), env, { waitUntil: () => {} });
+    } finally {
+      globalThis.fetch = prev;
+    }
+    const streamed = await res.text();
+    assert.match(streamed, /回源超时改成 30 秒/, '客户端拿到的流内容不能被旁路改写');
+    assert.match(streamed, /边缘节点回源抖动/, '第二段也要原样透传');
+    // 写回在后台进行，给它一点时间（内存假存储，通常 < 10ms）
+    await new Promise(r => setTimeout(r, 300));
+    const work = await memLayers.getWorking(env, 'web_wsmem1');
+    assert.ok(work && work.turns.length === 1, 'L1 应写入会话作用域，实际 ' + (work ? work.turns.length : 'null'));
+    assert.match(work.turns[0].ai, /回源超时/, 'L1 里应存下结论');
+    const eps = await memLayers.getEpisodes(env, 'webu_cmem1');
+    assert.ok(eps.length >= 1, 'L2 应写入浏览器作用域');
+  });
+
+  await checkAsync('Web 无 session_id 也不兜底成 web_default：不会读到别的调用方的记忆', async () => {
+    const env = Object.assign({}, webKbEnv, { WEB_MEMORY: '1', WEB_KB_FIRST: '0' });
+    // 先往「兜底桶」里放一条别人的私密记忆
+    await memLayers.appendWorkingTurn(env, 'web_default', { user: '别人的私密问题：我家地址是哪里', ai: '别人的结论' });
+    await memMod.agentSaveMemory(env, 'web_default', '别人的私密事实：住址在某某路 1 号');
+    const captured = await postChat({
+      messages: [{ role: 'user', content: '帮我看看这个部署方案有什么风险' }],
+      model: 'm1', agent: false,
+    }, env);
+    const all = JSON.stringify(captured.messages);
+    assert.equal(/别人的私密问题/.test(all), false, '不能读到 web_default 的工作记忆');
+    assert.equal(/某某路/.test(all), false, '不能读到 web_default 的长期记忆');
+  });
+
+  await checkAsync('L3 同样对空作用域短路：不读不写公共桶 kb/agent_mem_', async () => {
+    assert.deepEqual(await memMod.agentGetMemories(memEnv, ''), []);
+    assert.deepEqual(await memMod.agentSearchMemories(memEnv, '', '任意', 5), []);
+    assert.match(await memMod.agentSaveMemory(memEnv, '', '无主的事实'), /缺少用户标识/);
+    assert.deepEqual(await memMod.agentForgetMemory(memEnv, '', 'x'), { removed: 0 });
+    assert.equal(await memMod.agentTouchMemories(memEnv, '', ['x']), false);
+  });
+
+  await checkAsync('/healthz 暴露 debug.memory（记忆是静默功能，必须有可观测数字）', async () => {
+    const res = await mod.handle({ request: new Request('https://example.com/healthz'), env: { STORAGE_DEBUG: '1' }, waitUntil: () => {} });
+    const j = await res.json();
+    assert.ok(j.debug.memory, '应有 memory 段');
+    assert.equal(typeof j.debug.memory.turnsRecorded, 'number');
+    assert.ok(j.debug.memory.turnsRecorded > 0, '前面写入过记忆，计数应大于 0');
+    assert.equal(typeof j.debug.memory.writeFails, 'number');
   });
 
   console.log('\n=== 结果 ===');

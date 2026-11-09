@@ -6,7 +6,8 @@ import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '..
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
-import { agentGetMemories, agentForgetMemory } from '../agent/memory.js';
+import { agentForgetMemory } from '../agent/memory.js';
+import { memoryReport, recallMemory, formatRecallResult, clearWorking, forgetEpisodes, memoryStats } from '../agent/memory-layers.js';
 import { agentGetMode, agentSetMode } from '../agent/mode.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
@@ -87,7 +88,7 @@ function parseCommand(t) {
 // 群组 @ 提及与引用回复识别缓存（key: bot token -> lowercase username）
 const botUsernameCache = new Map();
 const KNOWN_TG_COMMANDS = new Set([
-  '/start', '/model', '/clear', '/new', '/help', '/memory', '/kb', '/forget', '/agent',
+  '/start', '/model', '/clear', '/new', '/help', '/memory', '/recall', '/kb', '/forget', '/agent',
   '/wxlogin', '/wxstatus', '/wxunbind'
 ]);
 
@@ -539,7 +540,7 @@ export async function handleTgWebhook(request, env) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 20 项工具（🔍 搜索、📄 网页、🌐 维基百科、💱 实时汇率/币价、🧮 科学计算、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾🔎📚📖 存取与检索知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 21 项工具（🔍 搜索、📄 网页、🌐 维基百科、💱 实时汇率/币价、🧮 科学计算、🌤 天气、🕐 时间/日期推算），并用 🧠 三层记忆（工作/情景/语义）记住上下文、用 💾🔎📚📖 存取与检索知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard }
             });
@@ -549,7 +550,10 @@ export async function handleTgWebhook(request, env) {
           if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
             await tgClearHistory(env, chatId);
             await agentClearResumeState(env, chatId);
-            await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
+            // 只清 L1 工作记忆：长期事实（L3）与过往对话摘要（L2）正是「换话题也不想丢」的部分，
+            // 跟着 /clear 一起删掉的话，用户会以为机器人把他说过的话全忘了。
+            await clearWorking(env, chatId).catch(() => {});
+            await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。\n（长期记忆与过往对话摘要已保留，可用 /memory 查看；要删记忆用 /forget 关键词。）" });
             return;
           }
 
@@ -559,38 +563,41 @@ export async function handleTgWebhook(request, env) {
               text: "🤖 命令列表：\n\n"
                 + "/start、/model —— 选择对话模型\n"
                 + "/agent —— 切换 Agent / 普通对话模式\n"
-                + "/clear —— 清空当前对话上下文\n"
-                + "/memory —— 查看长期记忆\n"
-                + "/forget 关键词 —— 删除包含关键词的记忆\n"
+                + "/clear —— 清空当前对话上下文（保留长期记忆）\n"
+                + "/memory —— 查看三层记忆（工作 / 情景 / 语义）\n"
+                + "/recall 关键词 —— 检索三层记忆\n"
+                + "/forget 关键词 —— 删除长期记忆（--epi 删情景记忆，--all 全删）\n"
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
                 + "/wxlogin、/wxstatus、/wxunbind ——（私聊专属）安全扫码绑定/查看/解绑微信 ClawBot\n"
                 + "任务太长被暂停时，发送「继续」可接着做\n\n"
                 + "✨ 支持直接发送图片（多模态识图）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
-                + "🛠️ Agent 工具箱（20 项零密钥工具）：🔍 联网搜索、📄 结构化网页阅读（L1 分页缓存）、🌐 维基百科、🐙 GitHub 仓库检索、🎓 arXiv 论文检索、🔥 科技/开源实时热榜、💱 实时汇率/加密币价、🧮 科学/统计计算器、📏 单位与进制换算、🔤 文本/哈希/编码工具、🖧 IP/DNS 网络查询、🌤 3日天气预报、🕐 时间与日期推算、🧠🗑️ 长期记忆存取、💾 知识库保存、🔎 知识库全文检索、📚 文档列表、📖 分页精读（带章节目录跳读）。"
-                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 全套零配置增强）"
+                + "🛠️ Agent 工具箱（21 项零密钥工具）：🔍 联网搜索、📄 结构化网页阅读（L1 分页缓存）、🌐 维基百科、🐙 GitHub 仓库检索、🎓 arXiv 论文检索、🔥 科技/开源实时热榜、💱 实时汇率/加密币价、🧮 科学/统计计算器、📏 单位与进制换算、🔤 文本/哈希/编码工具、🖧 IP/DNS 网络查询、🌤 3日天气预报、🕐 时间与日期推算、🧠 三层记忆检索、🗑️ 记忆管理、💾 知识库保存、🔎 知识库全文检索、📚 文档列表、📖 分页精读（带章节目录跳读）。"
+                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 三层记忆 · 全套零配置增强）"
             });
             return;
           }
 
           if (cmd && cmd.cmd === '/memory') {
-            const mems = await agentGetMemories(env, chatId);
-            if (!mems.length) {
-              await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆" });
-            } else {
-              let text = '🧠 长期记忆（共' + mems.length + '条）：\n';
-              mems.forEach((mm, i) => { text += (i + 1) + '. ' + mm.fact + '\n'; });
-              text += '\n用 /forget 关键词 删除记忆，或直接对我说「忘掉关于xxx的记忆」。';
-              for (let s = 0; s < text.length; s += 4000) {
-                await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
-              }
+            const text = await memoryReport(env, chatId);
+            for (let s = 0; s < text.length; s += 4000) {
+              await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
+            }
+            return;
+          }
+
+          if (cmd && cmd.cmd === '/recall') {
+            const r = await recallMemory(env, chatId, cmd.rest, { limit: 8 });
+            const text = formatRecallResult(r);
+            for (let s = 0; s < text.length; s += 4000) {
+              await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
             }
             return;
           }
 
           if (cmd && cmd.cmd === '/kb') {
-            const mems = await agentGetMemories(env, chatId);
+            const st = await memoryStats(env, chatId);
             let text = '📚 知识库总览\n\n';
-            text += '🧠 长期记忆：共' + mems.length + '条（/memory 查看，/forget 关键词 删除）\n\n';
+            text += '🧠 三层记忆：工作 ' + st.workTurns + ' 轮 / 情景 ' + st.episodes + ' 条 / 语义 ' + st.semantic + ' 条（/memory 查看，/recall 关键词 检索）\n\n';
             text += await toolListDocs(env);
             text += '\n\n💾 保存文档：对我说"把…存成知识库文档"或直接上传 .md/.txt 文件；🗑️ 删文档：说"删除知识库文档《标题》"';
             for (let s = 0; s < text.length; s += 4000) {
@@ -600,14 +607,32 @@ export async function handleTgWebhook(request, env) {
           }
 
           if (cmd && cmd.cmd === '/forget') {
-            const kw = cmd.rest;
+            let kw = cmd.rest;
+            // 分层删除：--epi 只删情景记忆（过往对话摘要），--all 两层都删，默认只删长期事实。
+            // 默认行为保持不变，避免老用户一句 /forget 猫 把历史摘要也清掉。
+            let layer = 'semantic';
+            if (/^--(epi|episodic)\s+/i.test(kw)) { layer = 'episodic'; kw = kw.replace(/^--(epi|episodic)\s+/i, ''); }
+            else if (/^--all\s+/i.test(kw)) { layer = 'all'; kw = kw.replace(/^--all\s+/i, ''); }
+            kw = kw.trim();
             if (!kw) {
-              await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的记忆" });
+              await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的长期记忆\n/forget --epi 猫 —— 只删情景记忆｜/forget --all 猫 —— 两层都删" });
             } else {
-              const rr = await agentForgetMemory(env, chatId, kw);
+              const parts = [];
+              let persistError = '';
+              if (layer === 'semantic' || layer === 'all') {
+                const rr = await agentForgetMemory(env, chatId, kw);
+                if (rr.persistError) persistError = rr.persistError;
+                else if (rr.removed > 0) parts.push(rr.removed + ' 条长期记忆');
+              }
+              if (layer === 'episodic' || layer === 'all') {
+                const re = await forgetEpisodes(env, chatId, kw);
+                if (re.removed > 0) parts.push(re.removed + ' 条情景记忆');
+              }
               await tgApi('sendMessage', {
                 chat_id: chatId,
-                text: rr.persistError ? '⚠️ ' + rr.persistError : (rr.removed > 0 ? '🗑 已删除 ' + rr.removed + ' 条包含「' + kw + '」的记忆。' : '没有找到包含「' + kw + '」的记忆。')
+                text: persistError ? '⚠️ ' + persistError
+                  : (parts.length ? '🗑 已删除 ' + parts.join('、') + '（包含「' + kw + '」）。'
+                    : '没有找到包含「' + kw + '」的' + (layer === 'episodic' ? '情景记忆' : '记忆') + '。')
               });
             }
             return;

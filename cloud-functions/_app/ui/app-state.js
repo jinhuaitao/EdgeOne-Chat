@@ -43,6 +43,19 @@ export default `  // 会话本地存储：v7.0.1 起改用 eochat_sessions。
   const ACCESS_TOKEN_KEY = 'access_token';
   let accessToken = localStorage.getItem(ACCESS_TOKEN_KEY) || '';
 
+  // v7.10.0：浏览器级记忆标识。三层记忆里 L2（情景）/ L3（语义）要跨会话生效，
+  // 就必须有一个比「单个会话 id」更稳定的作用域；否则每开一个新对话，机器人就重新认识你一次。
+  // 只在本机生成随机串，不上传任何账号信息；清掉 localStorage 即等于换一个新身份。
+  const CLIENT_ID_KEY = 'eochat_client_id';
+  let clientId = '';
+  try {
+    clientId = localStorage.getItem(CLIENT_ID_KEY) || '';
+    if (!/^[a-zA-Z0-9_-]{8,64}$/.test(clientId)) {
+      clientId = 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem(CLIENT_ID_KEY, clientId);
+    }
+  } catch (e) { clientId = ''; }
+
   const messagesDiv = document.getElementById('messages');
   const emptyState = document.getElementById('emptyState');
   const scrollArea = document.getElementById('scrollArea');

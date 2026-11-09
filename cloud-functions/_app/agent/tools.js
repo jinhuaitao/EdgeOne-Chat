@@ -1,8 +1,9 @@
-// Agent 工具定义与分发（全套无配置增强：共 20 个零密钥工具 + L1 结果缓存与并发去重）
+// Agent 工具定义与分发（全套无配置增强：共 21 个零密钥工具 + L1 结果缓存与并发去重）
 
 import { toolWebSearch, toolWebFetch, toolGithubLookup, toolArxivSearch, toolTrendingNews, clearWebPageCache } from './tools-web.js';
 import { toolCalculate, toolGetTime, toolGetWeather, toolExchangeRate, toolWikiLookup, toolUnitConvert, toolTextToolkit, toolNetworkLookup } from './tools-local.js';
-import { agentSaveMemory, agentForgetMemory } from './memory.js';
+import { agentSaveMemory, agentForgetMemory, agentTouchMemories } from './memory.js';
+import { recallMemory, formatRecallResult, forgetEpisodes } from './memory-layers.js';
 import { toolSaveDoc, toolListDocs, toolSearchDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
 import { clearKbPrefetchCache } from '../kb/prefetch.js';
 import { isToolFailure } from './result.js';
@@ -148,13 +149,13 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'trending_news',
-        description: '实时热榜：Hacker News 科技热榜（source=hn，默认）或 GitHub 近两周飙升项目（source=github）。',
+        description: '实时热榜：Hacker News 科技热榜（source=hn，默认）或 GitHub 近两周飙升项目。',
         parameters: {
           type: 'object',
           properties: {
-            source: { type: 'string', description: '热榜来源：hn（Hacker News 实时热榜，默认）或 github（GitHub 近两周飙升新项目）' },
-            language: { type: 'string', description: '可选：当 source="github" 时按编程语言筛选，如 python、typescript、rust' },
-            count: { type: 'integer', description: '可选：返回条数，1-8，默认 5' }
+            source: { type: 'string', description: 'hn（默认）或 github' },
+            language: { type: 'string', description: '可选：source=github 时按语言筛选，如 python' },
+            count: { type: 'integer', description: '可选：条数，1-8，默认 5' }
           }
         }
       }
@@ -179,7 +180,7 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'calculate',
-        description: '精确计算器：四则运算、乘方(^)、取余、括号、常量(pi/e/tau/phi)及 sqrt/cbrt/round/log/ln/sin/atan2/hypot/min/max/sum/avg/median/std/var/gcd/lcm/fact/comb/perm 等函数。任何数学或统计运算都用它，不要心算。',
+        description: '精确计算器：四则运算、乘方(^)、括号、常量(pi/e/tau/phi)及 sqrt/log/round/sin/sum/avg/median/std/gcd/lcm/fact/comb/perm 等。任何数学或统计运算都用它，不要心算。',
         parameters: {
           type: 'object',
           properties: {
@@ -193,15 +194,15 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'unit_convert',
-        description: '单位与进制换算：长度、重量、温度、面积、体积、速度、数据存储，以及 2~36 进制大整数互转（传 base_from/base_to）。',
+        description: '单位与进制换算：长度、重量、温度、面积、体积、速度、数据存储，以及 2~36 进制互转（传 base_from/base_to）。',
         parameters: {
           type: 'object',
           properties: {
-            value: { type: ['number', 'string'], description: '要转换的数值或进制字符串（如 100 或 "FF"）' },
-            from: { type: 'string', description: '源单位（如 km、lb、F、亩、GB）或进制名（bin/oct/dec/hex）' },
-            to: { type: 'string', description: '目标单位（如 mi、kg、C、m2、MB）或进制名（bin/oct/dec/hex）' },
-            base_from: { type: 'integer', description: '可选：进制转换时的源进制（2~36）' },
-            base_to: { type: 'integer', description: '可选：进制转换时的目标进制（2~36）' }
+            value: { type: ['number', 'string'], description: '数值或进制字符串（100 或 "FF"）' },
+            from: { type: 'string', description: '源单位（km、lb、F、亩、GB）或进制名（bin/oct/dec/hex）' },
+            to: { type: 'string', description: '目标单位（mi、kg、C、m2、MB）或进制名' },
+            base_from: { type: 'integer', description: '可选：源进制（2~36）' },
+            base_to: { type: 'integer', description: '可选：目标进制（2~36）' }
           },
           required: ['value']
         }
@@ -211,14 +212,14 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'text_toolkit',
-        description: '文本与编码工具箱：字数/汉字/词/行/UTF-8 字节统计（stats）、SHA 哈希（hash）、Base64、URL 编解码、生成 UUID。需精确字数或编码转换时必须调用。',
+        description: '文本与编码工具箱：字数/汉字/词/行/字节统计（stats）、SHA 哈希、Base64、URL 编解码、UUID。需精确字数或编码转换时必须调用。',
         parameters: {
           type: 'object',
           properties: {
-            action: { type: 'string', description: '操作类型：stats（字数统计，默认）、hash、base64_encode、base64_decode、url_encode、url_decode、uuid' },
-            text: { type: 'string', description: '要处理的文本内容（action="uuid" 时可省略）' },
-            algorithm: { type: 'string', description: '可选：action="hash" 时的算法，SHA-256（默认）/ SHA-1 / SHA-384 / SHA-512' },
-            count: { type: 'integer', description: '可选：action="uuid" 时生成的数量（1~10，默认 1）' }
+            action: { type: 'string', description: 'stats（默认）/hash/base64_encode/base64_decode/url_encode/url_decode/uuid' },
+            text: { type: 'string', description: '要处理的文本（uuid 时可省略）' },
+            algorithm: { type: 'string', description: '可选：SHA-256（默认）/SHA-1/SHA-384/SHA-512' },
+            count: { type: 'integer', description: '可选：uuid 数量，1~10，默认 1' }
           },
           required: ['action']
         }
@@ -243,14 +244,14 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'get_time',
-        description: '获取当前时间（可指定 IANA 时区），或算两个日期的天数差（target_date）、某日期加减 N 天（add_days）。不要心算日历。',
+        description: '获取当前时间（可指定时区），或算两个日期天数差（target_date）、加减 N 天（add_days）。不要心算日历。',
         parameters: {
           type: 'object',
           properties: {
-            timezone: { type: 'string', description: 'IANA 时区，如 Asia/Shanghai、America/New_York，默认 Asia/Shanghai' },
-            base_date: { type: 'string', description: '可选：基准日期 YYYY-MM-DD，默认取当前时区的今天' },
-            target_date: { type: 'string', description: '可选：目标日期 YYYY-MM-DD，用于计算与基准日期相差的天数和周数' },
-            add_days: { type: 'integer', description: '可选：在基准日期上加减的天数（正数向后推，负数向前推）' }
+            timezone: { type: 'string', description: 'IANA 时区，如 Asia/Shanghai，默认 Asia/Shanghai' },
+            base_date: { type: 'string', description: '可选：基准日期 YYYY-MM-DD，默认今天' },
+            target_date: { type: 'string', description: '可选：目标日期 YYYY-MM-DD，算与基准日期的天数差' },
+            add_days: { type: 'integer', description: '可选：基准日期加减的天数（负数为向前）' }
           }
         }
       }
@@ -273,11 +274,13 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'remember',
-        description: '保存关于用户的长期事实（偏好、生日、项目名、常用城市）。仅用户明确要求记住时调用。同一主题改口直接记新值，旧值自动覆盖。',
+        description: '保存用户的长期事实（偏好、生日、项目名、常用城市、长期要求）。仅用户明确要求记住时调用；同一主题改口直接记新值，旧值自动覆盖。',
         parameters: {
           type: 'object',
           properties: {
-            fact: { type: 'string', description: '一句话事实' }
+            fact: { type: 'string', description: '一句话事实' },
+            kind: { type: 'string', description: '可选：fact（默认）/preference/profile/project/instruction' },
+            tags: { type: 'array', items: { type: 'string' }, description: '可选：标签，如 ["工作"]' }
           },
           required: ['fact']
         }
@@ -287,11 +290,12 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'forget_memory',
-        description: '按关键词删除已保存的用户长期记忆。仅用户明确要求忘掉/删除某条记忆时调用。',
+        description: '删除记忆。默认只删长期事实；layer=episodic 删情景记忆，all 两层都删。仅用户明确要求忘掉时调用。',
         parameters: {
           type: 'object',
           properties: {
-            keyword: { type: 'string', description: '要删除的记忆关键词' }
+            keyword: { type: 'string', description: '要删除的记忆关键词' },
+            layer: { type: 'string', description: '可选：semantic（默认）/episodic/all' }
           },
           required: ['keyword']
         }
@@ -300,14 +304,29 @@ function getAgentTools(kbReadOnly) {
     {
       type: 'function',
       function: {
-        name: 'save_doc',
-        description: '把长篇内容保存为知识库文档（写入 kb/docs/，文件名取自标题）。仅用户明确要求保存文档时调用；简短个人信息用 remember。只有它返回成功才能说已保存。',
+        name: 'recall_memory',
+        description: '检索三层记忆：L1 本次会话要点、L2 过往对话、L3 用户长期事实。用户说"上次/之前/我说过"或需确认历史偏好时用。',
         parameters: {
           type: 'object',
           properties: {
-            title: { type: 'string', description: '文档标题，用作文件名，如"甲骨文云ARM放货知识库"' },
-            content: { type: 'string', description: 'Markdown 格式的正文' },
-            source: { type: 'string', description: '可选：原文链接，会记入文件头' }
+            query: { type: 'string', description: '检索关键词；留空返回最近条目' },
+            layer: { type: 'string', description: '可选：all（默认）/work/episodic/semantic' },
+            count: { type: 'integer', description: '可选：每层条数，1-8，默认 5' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'save_doc',
+        description: '把长篇内容存为知识库文档（文件名取自标题）。仅用户明确要求保存文档时调用；简短个人信息用 remember。只有它返回成功才能说已保存。',
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: '文档标题，用作文件名' },
+            content: { type: 'string', description: 'Markdown 正文' },
+            source: { type: 'string', description: '可选：原文链接，记入文件头' }
           },
           required: ['title', 'content']
         }
@@ -325,12 +344,12 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'search_docs',
-        description: '在知识库全部文档里全文检索（标题 + 正文，支持多关键词与中文 2-gram），返回相关性最高的片段及其文档名与 offset。不确定该读哪篇、或要确认讲过没讲过时先用它。',
+        description: '在知识库全部文档里全文检索（标题+正文，多关键词），返回最相关片段、文档名与 offset。不确定读哪篇、或要确认讲过没讲过时先用它。',
         parameters: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: '检索关键词，可空格分隔多个词，如"回源 超时 重试"' },
-            count: { type: 'integer', description: '可选：返回片段数，1-8，默认 3' }
+            query: { type: 'string', description: '关键词，空格分隔多个，如"回源 超时"' },
+            count: { type: 'integer', description: '可选：片段数，1-8，默认 3' }
           },
           required: ['query']
         }
@@ -388,15 +407,41 @@ async function runRawAgentTool(name, args, env, chatId) {
     case 'network_lookup': return await toolNetworkLookup(args);
     case 'get_time': return toolGetTime(args.timezone, args);
     case 'get_weather': return await toolGetWeather(args.city);
-    case 'remember': return await agentSaveMemory(env, chatId, args.fact);
+    case 'remember': return await agentSaveMemory(env, chatId, args.fact, { kind: args.kind, tags: args.tags });
     case 'forget_memory': {
       const kw = String(args.keyword || '').trim();
       if (!kw) return '关键词为空，未删除任何记忆';
-      const rr = await agentForgetMemory(env, chatId, kw);
-      if (rr.persistError) return rr.persistError;
-      return rr.removed > 0
-        ? '已删除 ' + rr.removed + ' 条包含「' + kw + '」的长期记忆'
-        : '未找到包含「' + kw + '」的长期记忆';
+      const layer = String(args.layer || 'semantic').toLowerCase();
+      const parts = [];
+      let persistError = '';
+      if (layer === 'semantic' || layer === 'all') {
+        const rr = await agentForgetMemory(env, chatId, kw);
+        if (rr.persistError) persistError = rr.persistError;
+        else if (rr.removed > 0) parts.push(rr.removed + ' 条长期事实');
+      }
+      if (layer === 'episodic' || layer === 'epi' || layer === 'all') {
+        const re = await forgetEpisodes(env, chatId, kw);
+        if (re.removed > 0) parts.push(re.removed + ' 条情景记忆');
+      }
+      if (persistError) return persistError;
+      if (!parts.length) {
+        return layer === 'episodic' || layer === 'epi'
+          ? '未找到包含「' + kw + '」的情景记忆'
+          : '未找到包含「' + kw + '」的长期记忆';
+      }
+      return '已删除 ' + parts.join('、') + '（包含「' + kw + '」）';
+    }
+    case 'recall_memory': {
+      if (String(env.MEMORY_LAYERS || '1') === '0') {
+        return '三层记忆已被 MEMORY_LAYERS=0 关闭，本次没有可检索的记忆。请如实告知用户，不要凭空回忆。';
+      }
+      const r = await recallMemory(env, chatId, args.query, { layer: args.layer, limit: args.count });
+      // 命中语义记忆时记录使用度：常用的事实以后更容易被排到前面。
+      // 只在这里记（显式检索），不在每轮注入时记 —— 避免每轮都写一次索引。
+      if (r.semantic && r.semantic.length) {
+        try { await agentTouchMemories(env, chatId, r.semantic.map(m => m.fact)); } catch (e) {}
+      }
+      return formatRecallResult(r);
     }
     case 'save_doc': {
       const r = await toolSaveDoc(env, chatId, args);

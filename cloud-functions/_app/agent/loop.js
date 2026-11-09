@@ -22,6 +22,7 @@ import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
 import { getAgentTools, execAgentTool, getAgentToolCacheStats } from './tools.js';
 import { agentGetMemories } from './memory.js';
+import { getWorking, getEpisodes, pickRelevantEpisodes, recordTurnMemory, layersEnabled } from './memory-layers.js';
 import { buildAgentSystemPrompt, buildPromptToolManual } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { kbPrefetch } from '../kb/prefetch.js';
@@ -66,6 +67,9 @@ function newTurnStats() {
     promptChars: 0,
     // 上游给了 usage 才累加（部分通道不回传，保持 0 比编一个数字诚实）
     promptTokens: 0, completionTokens: 0,
+    // v7.10.0：本轮用过哪些工具、存过哪些文档 —— 情景记忆的「线索」，
+    // 让以后能回答「上次我们是查了哪些资料才定的」。
+    toolNames: [], docTitles: [],
   };
 }
 
@@ -202,6 +206,20 @@ function extractMsgPlainText(content) {
   return String(content || '');
 }
 
+// 一轮结束后写回 L1/L2。三道保险，缺一不可：
+//   1) 只有拿到最终答案才写（error / fallback 不写，否则记忆里会留下半截对话）；
+//   2) 最多等 0.8 秒 —— 记忆是增强项，不能为了记一条摘要让用户多等；
+//   3) 失败只计数，不抛错（Blob 抖动时用户依然应该看到完整回答）。
+async function recordTurnMemorySafe(env, chatId, turn, opts) {
+  try {
+    const job = recordTurnMemory(env, chatId, turn, opts);
+    const timeout = new Promise(resolve => setTimeout(() => resolve({ ok: false, reason: 'timeout' }), 800));
+    return await Promise.race([job, timeout]);
+  } catch (e) {
+    return { ok: false, reason: 'error' };
+  }
+}
+
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
   const kbReadOnly = !!(opts && opts.kbReadOnly);
@@ -209,11 +227,20 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   // deadline 必须在预检索之前算：预检索本身也要花时间（默认上限 2.5 秒），
   // 算在 deadline 之后等于「预算外白送 2.5 秒」，Web 端的 90 秒承诺就会变成 92.5 秒。
   const deadline = tgAgentDeadline(env, opts);
-  const [memories, kbDocs] = await Promise.all([
-    kbReadOnly ? Promise.resolve([]) : agentGetMemories(env, chatId),
+  // 三层记忆（v7.10.0）：
+  //   L3 语义记忆在旧实现里是「kbReadOnly 就不读」——于是 Web 端完全没有记忆，
+  //   连用户自己刚说过的话都不记得。现在读写分开：读由 memoryRead 控制（Web 也读），
+  //   写由 memoryWrite / kbReadOnly 控制（Web 仍不允许用工具写长期事实）。
+  const memScope = (opts && opts.memoryScope) || chatId;
+  const memRead = layersEnabled(env) && !(opts && opts.memoryRead === false);
+  const layeredOn = layersEnabled(env) && !(opts && opts.memoryLayers === false);
+  const [memories, kbDocs, workMem, episodes] = await Promise.all([
+    memRead ? agentGetMemories(env, memScope).catch(() => []) : Promise.resolve([]),
     shouldLoadKb ? kbGetRegistry(env).catch(() => null) : Promise.resolve(null),
+    layeredOn ? getWorking(env, chatId).catch(() => null) : Promise.resolve(null),
+    layeredOn ? getEpisodes(env, memScope).catch(() => []) : Promise.resolve([]),
   ]);
-  // v7.7.0：预检索。只注入标题列表时，模型仍可能「看了标题就凭训练知识作答」，
+  // v7.7.0：预检索。只注入标题列表时，模型仍可能「看了标题就凭知识库作答」，
   // 或者先花一步 search_docs 才摸到正文。这里在进入循环前直接把最相关的 2 段正文
   // 取出来放进提示词，Web 端（含关闭 Agent 的普通对话）都能第一时间用上知识库。
   // 预检索自带预算与跳过规则，失败一律静默降级（不影响正常回答）。
@@ -232,7 +259,12 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
       if (pre && pre.ok) kbPrefetchText = pre.text;
     }
   }
-  let systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText);
+  // L2 情景记忆只挑与本次提问相关的几条注入（最多 3 条），不做全量回放：
+  // 情景记忆一多，全量塞进去会把真正的用户问题挤到上下文深处。
+  const layered = layeredOn
+    ? { work: workMem, episodes: pickRelevantEpisodes(episodes, query, 3), budget: opts && opts.memoryInjectChars }
+    : null;
+  let systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText, layered);
   // 降级模式：通道 400 拒绝 tools 参数时，把工具清单与调用格式写进提示词，
   // 由模型用 DSML 文本格式发起调用（loop 里原本就有 DSML 解析，这里只是让它有输入）。
   // 旧实现遇到这种通道直接 allowTools=false —— 用户拿到的是一个"没有工具"的答案，
@@ -249,10 +281,23 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const r = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText, stats,
-    !!(opts && opts.promptTools));
+    !!(opts && opts.promptTools), memScope);
   // fallback 表示「这个通道不支持 tools」，会立刻用不带工具的方式重跑一遍；
   // 那一轮不计入统计，否则 avgSteps 会被一堆 0 步的降级轮稀释。
   if (!(r && r.fallback)) commitTurnStats(stats, r);
+  // v7.10.0：写回三层记忆的 L1（工作记忆）与 L2（情景记忆）。
+  // 放在这里而不是 handler 里：三条通道（TG / Web / 微信）都走这个函数，
+  // 写回逻辑只有一份，不会出现「微信记得、Web 不记得」这种各端不一致。
+  if (!(r && r.fallback) && !(r && r.error) && !(opts && opts.memoryWrite === false)) {
+    await recordTurnMemorySafe(env, chatId, {
+      userText: origUserText,
+      assistantText: (r && r.text) || '',
+      tools: stats.toolNames || [],
+      docs: stats.docTitles || [],
+      paused: !!(r && r.paused),
+      stopReason: (r && r.stopReason) || '',
+    }, { episodeScope: memScope });
+  }
   return r;
 }
 
@@ -266,12 +311,12 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const r = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, false, saved.origUserText || '', stats,
-    !!(saved.promptTools || (opts && opts.promptTools)));
+    !!(saved.promptTools || (opts && opts.promptTools)), (opts && opts.memoryScope) || chatId);
   commitTurnStats(stats, r);
   return r;
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, stats, promptTools) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, stats, promptTools, memScope) {
   const limits = agentLimits(env);
   const maxSteps = limits.maxSteps;
   // 收尾预留：循环内所有「还能不能再跑一步」的判断都用 deadline - reserve
@@ -569,10 +614,19 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         }
         let p = stepDedup.get(sig);
         if (!p) {
-          p = execAgentTool(fn.name, args, env, chatId, kbReadOnly, { budgetMs: batchBudget });
+          // 记忆类工具必须用「记忆作用域」而不是会话 id：Web 端 L1 跟会话（web_<sid>）、
+          // L2/L3 跟浏览器（webu_<client_id>），传错就会「刚聊过却查不到」。
+          p = execAgentTool(fn.name, args, env, memScope || chatId, kbReadOnly, { budgetMs: batchBudget });
           stepDedup.set(sig, p);
         }
         const result = await p;
+        // v7.10.0：记下本轮用了哪些工具、存了哪些文档，供情景记忆做「线索」。
+        // 只记名字不记参数：参数里可能有用户隐私（手机号、地址），记忆不该复制这些。
+        if (fn.name && stats.toolNames.indexOf(fn.name) === -1) stats.toolNames.push(fn.name);
+        if (fn.name === 'save_doc' && !isToolFailure(result)) {
+          const docTitle = String(args.title || '').trim().slice(0, 60);
+          if (docTitle && stats.docTitles.indexOf(docTitle) === -1) stats.docTitles.push(docTitle);
+        }
         // 只有成功才算「这一次参数用过了」；失败留给模型重试的机会
         if (firstInBatch && !isToolFailure(result)) sigSuccess.set(sig, doneCount + 1);
         // 分页类工具（web_fetch / read_doc）保留它们承诺的页大小，

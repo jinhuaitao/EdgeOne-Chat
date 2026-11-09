@@ -19,7 +19,8 @@ import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '..
 import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
-import { agentGetMemories, agentForgetMemory } from '../agent/memory.js';
+import { agentForgetMemory } from '../agent/memory.js';
+import { memoryReport, recallMemory, formatRecallResult, clearWorking, forgetEpisodes, memoryStats } from '../agent/memory-layers.js';
 import { agentGetMode, agentSetMode } from '../agent/mode.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
@@ -187,8 +188,12 @@ function wxSafeId(id) {
 }
 
 // 为微信用户生成与 Telegram / Web 隔离的会话 ID（复用 tg-history / memory / mode / resume）
+// v7.10.1：userId 缺失时返回空串，不再兜底成 'wx_default'。
+// 兜底会让所有解析不出 userId 的消息共用一份历史与记忆——别人的对话会出现在你的上下文里。
+// 调用方拿到空串时按「无身份」处理：不读不写历史与记忆，只回这一条消息。
 function wxSessionChatId(userId) {
-  return 'wx_' + String(userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 56);
+  const u = String(userId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 56);
+  return u ? ('wx_' + u) : '';
 }
 
 function wxChannelVersion(env) {
@@ -533,8 +538,12 @@ function parseWxCommand(text) {
   if (/^(清空|清空上下文|新对话|重置|重置对话|清空记忆上下文)$/.test(s)) {
     return { cmd: '/clear', rest: '' };
   }
-  if (/^(记忆|查看记忆|长期记忆)$/.test(s)) {
+  if (/^(记忆|查看记忆|长期记忆|三层记忆|我的记忆)$/.test(s)) {
     return { cmd: '/memory', rest: '' };
+  }
+  const recallMatch = /^(?:回忆|回想|检索记忆|翻一下记忆|还记得)[:：\s]+([\s\S]+)$/.exec(s);
+  if (recallMatch && recallMatch[1].trim()) {
+    return { cmd: '/recall', rest: recallMatch[1].trim() };
   }
   const forgetMatch = /^(?:忘掉|删除记忆|清除记忆)\s+(.+)$/.exec(s);
   if (forgetMatch) {
@@ -964,7 +973,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       await sendReply(
         `🟢 EdgeOne-Chat 微信 ClawBot 助手 (v${APP_VERSION})\n`
         + `────────────\n`
-        + `🤖 当前模式：${useAgentNow ? 'Agent 智能体（20 项工具 + 记忆 + 知识库）' : '普通对话模式'}\n`
+        + `🤖 当前模式：${useAgentNow ? 'Agent 智能体（21 项工具 + 三层记忆 + 知识库）' : '普通对话模式'}\n`
         + `🎯 可用模型列表：\n${listLines}\n\n`
         + `💡 微信快捷口令（无需敲斜杠，直接发中文即可）：\n`
         + `• 发「模型 序号」（如：模型 2）—— 切换模型\n`
@@ -981,7 +990,9 @@ async function processWechatMessage(env, creds, rawMsg) {
     if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
       await tgClearHistory(env, chatId);
       await agentClearResumeState(env, chatId);
-      await sendReply('🧹 当前微信会话上下文已清空，可以开始新的话题了。', true);
+      // 只清 L1：长期事实与情景摘要保留（否则用户会以为机器人把他说过的话全忘了）
+      await clearWorking(env, chatId).catch(() => {});
+      await sendReply('🧹 当前微信会话上下文已清空，可以开始新的话题了。\n（三层记忆里的长期事实与过往对话摘要已保留，发「记忆」可查看。）', true);
       return { processed: true };
     }
 
@@ -998,9 +1009,10 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `• 「模型 2」或 /model 2 —— 切换到第 2 个模型\n`
         + `• 「画 宇航员猫咪」或 /draw —— 生成图片并直发微信原图\n`
         + `• 「模式」或 /agent —— 切换 Agent / 普通对话模式\n`
-        + `• 「清空」或 /clear —— 清空对话上下文\n`
-        + `• 「记忆」或 /memory —— 查看长期记忆（平时说「记住…」即可保存）\n`
-        + `• 「忘掉 关键词」或 /forget —— 删除指定记忆\n`
+        + `• 「清空」或 /clear —— 清空对话上下文（保留长期记忆）\n`
+        + `• 「记忆」或 /memory —— 查看三层记忆（工作 / 情景 / 语义）\n`
+        + `• 「回忆 关键词」或 /recall —— 检索三层记忆\n`
+        + `• 「忘掉 关键词」或 /forget —— 删除指定记忆（加 --epi 只删情景记忆）\n`
         + `• 「知识库」或 /kb —— 查看知识库文档与记忆统计\n`
         + `• 「状态」或 /status —— 查看通道健康度与会话统计\n`
         + `• 「继续」—— 当长任务暂停时接着完成推理\n\n`
@@ -1016,7 +1028,7 @@ async function processWechatMessage(env, creds, rawMsg) {
     // 4) /status 或「状态」
     if (cmd && cmd.cmd === '/status') {
       const useAgentNow = await agentGetMode(env, chatId);
-      const mems = await agentGetMemories(env, chatId);
+      const mst = await memoryStats(env, chatId);
       const hist = await tgGetHistory(env, chatId);
       await sendReply(
         `📊 微信 ClawBot 运行状态\n`
@@ -1025,7 +1037,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `• 当前模型：${activeModelObj.name} (${activeModelObj.id})\n`
         + `• 对话模式：${useAgentNow ? '🤖 Agent 智能体模式' : '💬 普通对话模式'}\n`
         + `• 上下文轮数：${Math.floor(hist.length / 2)} 轮（${hist.length} 条消息）\n`
-        + `• 长期记忆：${mems.length} 条\n`
+        + `• 三层记忆：工作 ${mst.workTurns} 轮 / 情景 ${mst.episodes} 条 / 语义 ${mst.semantic} 条\n`
         + `• 持久化存储：${env && env.R2 ? '✅ 已接通' : '⚠️ 内存模式'}\n`
         + `• 累计轮询/回复：${wxDiagMem.totalPolls} 次 / ${wxDiagMem.totalProcessed} 条`,
         true
@@ -1035,23 +1047,22 @@ async function processWechatMessage(env, creds, rawMsg) {
 
     // 5) /memory 或「记忆」
     if (cmd && cmd.cmd === '/memory') {
-      const mems = await agentGetMemories(env, chatId);
-      if (!mems.length) {
-        await sendReply('🧠 暂无长期记忆。\n\n平时直接在对话中对我说「记住xxx」即可永久保存，例如：记住，我喜欢用 Python 写脚本。', true);
-      } else {
-        let text = `🧠 长期记忆（共 ${mems.length} 条）：\n────────────\n`;
-        mems.forEach((mm, i) => { text += `${i + 1}. ${mm.fact}\n`; });
-        text += '\n💡 发送「忘掉 关键词」可删除对应记忆。';
-        await sendReply(text, true);
-      }
+      await sendReply(await memoryReport(env, chatId), true);
+      return { processed: true };
+    }
+
+    // 5b) /recall 或「回忆 关键词」
+    if (cmd && cmd.cmd === '/recall') {
+      const r = await recallMemory(env, chatId, cmd.rest, { limit: 8 });
+      await sendReply(formatRecallResult(r), true);
       return { processed: true };
     }
 
     // 6) /kb 或「知识库」
     if (cmd && cmd.cmd === '/kb') {
-      const mems = await agentGetMemories(env, chatId);
+      const mst = await memoryStats(env, chatId);
       let text = '📚 知识库总览（三端实时自动同步）\n────────────\n';
-      text += `🧠 长期记忆：共 ${mems.length} 条（发「记忆」查看，「忘掉 关键词」删除）\n\n`;
+      text += `🧠 三层记忆：工作 ${mst.workTurns} 轮 / 情景 ${mst.episodes} 条 / 语义 ${mst.semantic} 条（发「记忆」查看，「回忆 关键词」检索）\n\n`;
       text += await toolListDocs(env);
       text += '\n\n💡 快捷操作：\n• 直接在微信发送文件（.docx/.xlsx/.pptx/.pdf/.md/.txt/.csv/代码）即可【自动整理入库】\n• 发「整理知识库 标题」可将刚聊的内容自动整理入库\n• 发「读取文档 标题」查看内容 | 发「删除文档 标题」删除';
       await sendReply(text, true);
@@ -1104,12 +1115,27 @@ async function processWechatMessage(env, creds, rawMsg) {
 
     // 7) /forget 或「忘掉 关键词」
     if (cmd && cmd.cmd === '/forget') {
-      const kw = cmd.rest;
+      let kw = cmd.rest.trim();
+      // --epi 只删情景记忆，--all 两层都删；默认仍只删长期事实（保持老用户的行为不变）
+      let layer = 'semantic';
+      if (/^--(epi|episodic)\s+/i.test(kw)) { layer = 'episodic'; kw = kw.replace(/^--(epi|episodic)\s+/i, '').trim(); }
+      else if (/^--all\s+/i.test(kw)) { layer = 'all'; kw = kw.replace(/^--all\s+/i, '').trim(); }
       if (!kw) {
-        await sendReply('用法：发「忘掉 关键词」或「/forget 关键词」\n例如：忘掉 猫 —— 删除所有包含「猫」的记忆', true);
+        await sendReply('用法：发「忘掉 关键词」或「/forget 关键词」\n例如：忘掉 猫 —— 删除所有包含「猫」的长期记忆\n加 --epi 只删情景记忆，加 --all 两层都删', true);
       } else {
-        const rr = await agentForgetMemory(env, chatId, kw);
-        await sendReply(rr.persistError ? '⚠️ ' + rr.persistError : (rr.removed > 0 ? `🗑 已删除 ${rr.removed} 条包含「${kw}」的记忆。` : `没有找到包含「${kw}」的记忆。`), true);
+        const parts = [];
+        let persistError = '';
+        if (layer === 'semantic' || layer === 'all') {
+          const rr = await agentForgetMemory(env, chatId, kw);
+          if (rr.persistError) persistError = rr.persistError;
+          else if (rr.removed > 0) parts.push(`${rr.removed} 条长期记忆`);
+        }
+        if (layer === 'episodic' || layer === 'all') {
+          const re = await forgetEpisodes(env, chatId, kw);
+          if (re.removed > 0) parts.push(`${re.removed} 条情景记忆`);
+        }
+        await sendReply(persistError ? '⚠️ ' + persistError
+          : (parts.length ? `🗑 已删除 ${parts.join('、')}（包含「${kw}」）。` : `没有找到包含「${kw}」的${layer === 'episodic' ? '情景记忆' : '记忆'}。`), true);
       }
       return { processed: true };
     }
@@ -1120,7 +1146,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       await agentSetMode(env, chatId, !cur);
       await sendReply(
         !cur
-          ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 20 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、🎓 arXiv、🔥 热榜、💱 汇率/币价、🖧 DNS/IP、🧮 计算、📏 换算、🔤 编码、🌤 天气、🕐 时间、🔎 知识库检索），并支持 🧠 长期记忆与 💾📚📖 知识库文档读写。'
+          ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 21 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、🎓 arXiv、🔥 热榜、💱 汇率/币价、🖧 DNS/IP、🧮 计算、📏 换算、🔤 编码、🌤 天气、🕐 时间、🔎 知识库检索），并支持 🧠 三层记忆（工作/情景/语义）与 💾📚📖 知识库文档读写。'
           : '💬 已切换为普通对话模式\n\n单轮直接问答，不调用工具、不使用长期记忆。如需切回请再发「模式」或 /agent。',
         true
       );
