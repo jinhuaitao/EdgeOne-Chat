@@ -1,19 +1,12 @@
 // Agent 系统提示词：三层记忆（工作 / 情景 / 语义）与知识库按相关性注入
 
 import { formatLayeredMemory, memKindLabel } from './memory-layers.js';
+import { memoryTokens as sharedMemoryTokens } from './memory-text.js';
 
-// 记忆分词：英文按词、中文按 2-gram，用于相关性打分
+// 记忆分词：v7.10.3 统一到 memory-text.js（英文按词、中文按 2-gram，过滤停用词）。
+// 保留同名薄封装，避免改动 buildAgentSystemPrompt 里的所有调用点。
 function memoryTokens(s) {
-  const out = [];
-  const segs = String(s || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/);
-  for (const seg of segs) {
-    if (!seg) continue;
-    out.push(seg);
-    if (/[\u4e00-\u9fff]/.test(seg)) {
-      for (let i = 0; i + 2 <= seg.length; i++) out.push(seg.slice(i, i + 2));
-    }
-  }
-  return out;
+  return sharedMemoryTokens(s);
 }
 
 // 构建 Agent 系统提示词（记忆按【相关性 + 新近度】排序注入，而非只取最新）。
@@ -125,9 +118,21 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchT
     // 否则「记忆越全，上下文越挤」，最后把用户问题挤到看不见的位置。
     let budget = Math.max(2200, Math.min(6000, 8000 - layeredText.length));
     const picked = [];
+    const lineOf = (s) => '- ' + (s.m.kind && s.m.kind !== 'fact' ? '［' + memKindLabel(s.m.kind) + '］' : '')
+      + String(s.m.fact || '');
+    // v7.10.3：长期要求先无条件占位，再排其余条目。旧实现纯按相关性分数排，
+    // 一次完全不相关的提问 + 一批命中记忆，就能把「回答先给结论」挤出预算。
     for (const s of scored) {
+      if (s.m.kind !== 'instruction' || !String(s.m.fact || '')) continue;
+      const line = lineOf(s);
+      if (line.length > budget) continue;
+      picked.push(line);
+      budget -= line.length;
+    }
+    for (const s of scored) {
+      if (s.m.kind === 'instruction') continue;
       const f = String(s.m.fact || '');
-      const line = '- ' + (s.m.kind && s.m.kind !== 'fact' ? '［' + memKindLabel(s.m.kind) + '］' : '') + f;
+      const line = lineOf(s);
       if (!f || line.length > budget) continue;
       picked.push(line);
       budget -= line.length;

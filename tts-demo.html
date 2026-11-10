@@ -80,14 +80,14 @@
 
   <div class="messages">
     <div class="row user">
-      <div class="bubble">用三句话解释一下 Cloudflare Worker 是什么。</div>
+      <div class="bubble">用三句话解释一下 EdgeOne Makers 云函数是什么。</div>
     </div>
     <div class="row ai">
       <div class="bubble" data-demo="ai1">
         <div class="message-text md">
-          <p>Cloudflare Workers 是一种<strong>运行在边缘节点</strong>上的无服务器运行时。</p>
-          <p>你把一段 JavaScript 上传到 Cloudflare，它会在全球数百个机房就近执行，用户请求不必绕回源站。</p>
-          <p>典型用途是改请求、做鉴权、当 API 网关，或者在几毫秒内返回一个页面。</p>
+          <p>EdgeOne Makers 云函数是<strong>运行在腾讯云边缘节点</strong>上的无服务器运行时。</p>
+          <p>你把一段 JavaScript 随项目部署上去，请求会在离用户最近的边缘节点执行，不必绕回源站。</p>
+          <p>典型用途是改请求、做鉴权、当 API 网关，或者直接动态返回一个页面。</p>
         </div>
       </div>
     </div>
@@ -98,14 +98,12 @@
     <div class="row ai">
       <div class="bubble" data-demo="ai2">
         <div class="message-text md">
-          <p>就是一个默认导出对象里的 <code>fetch</code> 方法，例如：</p>
+          <p>就是一个默认导出的 <code>onRequest</code> 函数，例如：</p>
           <div class="code-wrapper">
             <div class="code-header"><span>js</span><span>示例</span></div>
-            <pre><code>export default {
-  async fetch(request, env) {
-    return new Response('Hello World');
-  }
-};</code></pre>
+            <pre><code>export default function onRequest(context) {
+  return new Response('Hello World');
+}</code></pre>
           </div>
           <p>可以看到，<strong>代码块在朗读时会自动跳过</strong>，不会被念成乱码。</p>
           <ul>

@@ -15,6 +15,7 @@ import { denyUnauthorized } from './auth.js';
 import { hitRateLimit } from './rate-limit.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders, keyPoolStatus } from './channel.js';
 import { readErrorBody } from './agent/stability.js';
+import { buildAccuracyHint } from './agent/accuracy.js';
 import { handleWebAgent } from './web-agent.js';
 import { agentTurnStats } from './agent/loop.js';
 import { handleTgWebhook } from './telegram/handler.js';
@@ -39,6 +40,7 @@ import { getWorking, getEpisodes, pickRelevantEpisodes, formatLayeredMemory, mem
 // 三点约束：
 //   1) 只旁路、不改写：客户端拿到的字节与原来完全一致；
 //   2) 不阻塞：不 await，写回失败/超时都不影响已经发出去的答案；
+//      但会注册到 ctx.waitUntil（v7.10.3），告诉平台响应后仍有后台工作，别提前冻结实例；
 //   3) 只收正文：上限 6000 字符，足够抽出结论句，也不会为一段长回答占满内存。
 const MEM_MIRROR_MAX_CHARS = 6000;
 
@@ -80,7 +82,7 @@ async function collectSseAssistantText(stream) {
 }
 
 // 旁路写回：调用方拿到响应后这里继续跑，不 await。
-function mirrorTurnToMemory(env, upstreamBody, meta) {
+function mirrorTurnToMemory(env, upstreamBody, meta, ctx) {
   if (!upstreamBody || typeof upstreamBody.tee !== 'function') return upstreamBody;
   let client = null;
   let mirror = null;
@@ -101,8 +103,14 @@ function mirrorTurnToMemory(env, upstreamBody, meta) {
       timeout,
     ]);
   })();
-  // 显式吞掉异常：记忆是增强项，绝不能冒泡成未处理的 Promise 拒绝
-  job.catch(() => {});
+  // 显式吞掉异常：记忆是增强项，绝不能冒泡成未处理的 Promise 拒绝。
+  // v7.10.3：同时把后台任务注册到 ctx.waitUntil。旧实现是纯 fire-and-forget，
+  // 运行时若在响应返回后立刻冻结实例，这一轮 L1/L2 就丢了（旧版已知限制 14）。
+  // waitUntil 只告诉平台「还有后台工作」，仍然不 await、不改动客户端字节流。
+  const safeJob = job.catch(() => {});
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    try { ctx.waitUntil(safeJob); } catch (e) {}
+  }
   return client;
 }
 
@@ -293,12 +301,23 @@ async function routeRequest(request, env, ctx) {
           }
         }
 
+        // v7.10.2：普通聊天（Agent 关闭）没有工具可用，算式只能靠模型心算，
+        // 是最容易给出错误近似值的场景。把确定性预计算结果与诚实要求一并注入 system。
+        if (!isImageAPI && String((env && env.AGENT_ACCURACY_HINT) || '1') !== '0') {
+          try {
+            const hint = buildAccuracyHint(lastUserText, { toolsAvailable: false });
+            if (hint) injectParts.push(hint.trim());
+          } catch (e) {
+            // 准确率提示是增强项，构造失败绝不能影响正常对话
+          }
+        }
+
         if (!isImageAPI && body.kb_first !== false && String(env.WEB_KB_FIRST || '1') !== '0') {
           try {
             const pre = await kbPrefetch(env, lastUserText, {
               budgetMs: parseInt(env.WEB_KB_PREFETCH_MS || '', 10) > 0
                 ? Math.min(parseInt(env.WEB_KB_PREFETCH_MS, 10), 6000)
-                : 2200,
+                : 2500,
               topN: 2,
             });
             if (pre && pre.ok && pre.text) injectParts.push(pre.text);
@@ -340,7 +359,7 @@ async function routeRequest(request, env, ctx) {
               userText: lastUserText,
               sessionScope: sessionScope,
               longScope: longScope,
-            })
+            }, ctx)
             : upstreamResponse.body;
           return new Response(outBody, { headers: SSE_HEADERS });
         } else {

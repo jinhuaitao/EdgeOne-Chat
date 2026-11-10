@@ -17,7 +17,15 @@ const SSE_HEADERS = {
 const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
-// 应用版本号（/help 显示；发版时同步 package.json）
+// 应用版本号（/help 显示；发版时同步 package.json / package-lock.json）
+// 7.10.3：三层记忆完善 —— 新增共用的 memory-text.js（统一分词/停用词/相似度）、
+//         L1 翻篇携带上场结论、L1 召回相关性过滤、结论句跳过开场白、
+//         instruction 在两种模式强制注入、L2 同结论合并、时间常量可配；
+//         修掉 URL/时间冒号导致 L3 事实互相覆盖、forget 大小写敏感、
+//         Web 普通模式写回纯 fire-and-forget 会丢记忆三个 bug。
+// 7.10.2：准确率增强与全量修复 —— 新增 agent/accuracy.js（确定性算式预计算 + 提问意图
+//        约束 + 工具参数别名归一化）、Agent 模式默认温度 0.3、/healthz 增采纳率观测；
+//        微信自接力链加三重闸门、SSRF 逐跳重定向校验、版本/默认值/注释一致性修复。
 // 7.10.1：三层记忆收口 —— 修掉五处会真实出错的边界：①普通对话模式（关闭 Agent）只注入
 //        不写回，L1/L2 永远为空（现在用 tee 旁路写回，不改动发给客户端的字节）；
 //        ②记忆时间按 UTC 渲染而提示词声明「北京时间」，模型会照着错时间答；③L2 同主题
@@ -44,7 +52,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 7.5.0：Agent 精修 —— 时间预算治理（工具/上游超时随剩余预算收缩 + 收尾预留）、
 //        跨步重复调用熔断、无新信息检测、上下文二级压缩、reasoning_content 回传策略。
 // 7.4.0：同步新增微信 ClawBot（腾讯官方 iLink Bot API / openclaw-weixin 协议）通道支持 + 四重防盗绑安全锁。
-const APP_VERSION = '7.10.1';
+const APP_VERSION = '7.10.3';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

@@ -13,7 +13,7 @@
 // 相关环境变量：
 //   IMAGE_PERSIST        1（默认）/ 0 —— 是否把图片转存到自己的存储
 //   IMAGE_MAX_MB         单张图片转存上限，默认 8（超过则退回上游原始链接）
-//   IMAGE_TIMEOUT_MS     下载上游图片的超时，默认 20000
+//   IMAGE_TIMEOUT_MS     下载上游图片的超时，默认 600000（10 分钟，生图上游普遍较慢）
 //   IMAGE_RESPONSE_FORMAT  请求上游时的 response_format，默认 url
 //   IMAGE_SIZE / IMAGE_OUTPUT_FORMAT / IMAGE_WATERMARK / IMAGE_PROMPT_EXTEND
 //                        透传给图像接口的可选参数，不设则不发送（用上游默认值）
@@ -26,6 +26,8 @@ const IMG_PREFIX = 'img/';
 const IMG_URL_PATH = '/api/img/';
 const DEFAULT_MAX_MB = 8;
 const DEFAULT_TIMEOUT_MS = 600000;
+// 远程图片转存时最多手动跟几跳重定向（每跳都重新做 SSRF 校验）
+const MAX_IMAGE_REDIRECTS = 5;
 
 const EXT_BY_MIME = {
   'image/png': 'png',
@@ -168,8 +170,36 @@ async function persistRemoteImage(env, url, timeoutMs) {
     try { ctrl.abort(); } catch (e) {}
   }, timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS);
   try {
-    const res = await fetch(parsed.toString(), { signal: ctrl.signal, redirect: 'follow' });
-    if (!res.ok) return null;
+    // v7.10.2：逐跳校验重定向。旧的 redirect:'follow' 只校验首跳，上游一个 302 就能
+    // 把请求带进 169.254.169.254 等内网地址；改成 manual 后每一跳都重过 isBlockedFetchHost。
+    // 残余风险：DNS rebinding（域名在校验后被解析到内网）无法在函数内封堵，
+    // 需前置 WAF / 出站代理层限制，见 net/ssrf.js 的说明。
+    let currentUrl = parsed.toString();
+    let res = null;
+    for (let hop = 0; hop < MAX_IMAGE_REDIRECTS; hop++) {
+      let hopUrl;
+      try { hopUrl = new URL(currentUrl); } catch (e) { return null; }
+      if (hopUrl.protocol !== 'http:' && hopUrl.protocol !== 'https:') return null;
+      if (isBlockedFetchHost(hopUrl.hostname)) return null;
+      res = await fetch(currentUrl, { signal: ctrl.signal, redirect: 'manual' });
+      const status = res.status || 0;
+      // 部分边缘运行时对 manual 返回 opaqueredirect（status=0、无 Location）。
+      // 读不到重定向头就退回运行时自动跟随，保证图片功能不被安全加固拖挂。
+      const opaque = status === 0;
+      const isRedirect = status >= 300 && status < 400;
+      if (!isRedirect && !opaque) break;
+      const loc = opaque ? null : res.headers.get('location');
+      try { await res.body.cancel(); } catch (e) {}
+      if (!loc) {
+        res = await fetch(currentUrl, { signal: ctrl.signal, redirect: 'follow' });
+        break;
+      }
+      let next;
+      try { next = new URL(loc, currentUrl); } catch (e) { return null; }
+      currentUrl = next.toString();
+      res = null;
+    }
+    if (!res || !res.ok) return null;
     const ctype = String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     // 内容类型不是图片就拒收，避免把错误页当成图片存下来
     if (ctype && ctype.indexOf('image/') !== 0) return null;

@@ -53,6 +53,11 @@ function isBlockedFetchHost(hostname) {
   if (h === 'metadata.azure.internal' || h === 'metadata') return true;
   if (h === 'metadata.tencentyun.com' || h === 'metadata.alibaba.internal') return true;
   if (h === '169.254.169.254.nip.io' || h.endsWith('.169.254.169.254.nip.io')) return true;
+  // v7.10.2：补齐云厂商新版元数据域名与常见内网域名后缀。
+  // 这些名字在公网 DNS 里通常解析不到，但一旦落在内网/容器 DNS 环境就会指向本机服务。
+  if (h === 'metadata.goog' || h.endsWith('.metadata.goog')) return true;
+  if (h.endsWith('.metadata.tencentyun.com')) return true;
+  if (h.endsWith('.internal') || h.endsWith('.local') || h.endsWith('.localdomain') || h.endsWith('.home.arpa')) return true;
   // —— IPv4 私网与保留段 ——
   // v6.8.9：容忍 1~4 段的 IPv4 简写（127.1 = 127.0.0.1、2130706433 = 127.0.0.1）。
   if (/^\d+(\.\d+){0,3}$/.test(h)) {
@@ -75,6 +80,7 @@ function isBlockedFetchHost(hostname) {
     if (b[0] === 100 && b[1] >= 64 && b[1] <= 127) return true;    // 100.64.0.0/10 CGNAT / 阿里云元数据
     if (b[0] === 192 && b[1] === 0 && b[2] === 0) return true;     // 192.0.0.0/24 IETF 协议保留（v6.9.5）
     if (b[0] === 192 && b[1] === 0 && b[2] === 2) return true;     // TEST-NET-1
+    if (b[0] === 192 && b[1] === 88 && b[2] === 99) return true;   // 192.88.99.0/24 6to4 中继任播（v7.10.2）
     if (b[0] === 198 && (b[1] === 18 || b[1] === 19)) return true; // 198.18.0.0/15 基准测试 / 代理保留（v6.9.5）
     if (b[0] === 198 && b[1] === 51 && b[2] === 100) return true;  // TEST-NET-2
     if (b[0] === 203 && b[1] === 0 && b[2] === 113) return true;   // TEST-NET-3

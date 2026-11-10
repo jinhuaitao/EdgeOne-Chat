@@ -7,6 +7,7 @@ import { recallMemory, formatRecallResult, forgetEpisodes } from './memory-layer
 import { toolSaveDoc, toolListDocs, toolSearchDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
 import { clearKbPrefetchCache } from '../kb/prefetch.js';
 import { isToolFailure } from './result.js';
+import { normalizeToolArgs } from './accuracy.js';
 
 // ==================== 工具结果 L1 缓存与同参并发去重 ====================
 // 对幂等只读工具进行短期缓存（仅缓存成功结果，失败结果绝不缓存），
@@ -65,7 +66,7 @@ function getAgentToolCacheStats() {
   return { size: toolResultCache.size, inFlight: inFlightTools.size, hits: cacheHits, misses: cacheMisses };
 }
 
-// ==================== Agent 工具定义（共 20 项零密钥工具） ====================
+// ==================== Agent 工具定义（共 21 项零密钥工具） ====================
 function getAgentTools(kbReadOnly) {
   const tools = [
     {
@@ -463,7 +464,9 @@ async function runRawAgentTool(name, args, env, chatId) {
 }
 
 async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
-  args = args || {};
+  // v7.10.2：参数别名归一化放在缓存 key 之前 —— 同一语义的不同写法应命中同一份结果缓存，
+  // 也避免模型把 expression 写成 expr 后白跑一步、再靠重试补救。
+  args = normalizeToolArgs(name, args);
   env = env || {};
   // v6.9.3 / v7.0.0 执行层硬校验：Web 端（kbReadOnly）即使模型幻觉出写入类工具调用，也绝不执行
   if (kbReadOnly && (name === 'remember' || name === 'forget_memory' || name === 'save_doc' || name === 'delete_doc')) {

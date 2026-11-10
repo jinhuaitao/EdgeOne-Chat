@@ -21,6 +21,7 @@ import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { agentSearchMemories, agentMemStats } from './memory.js';
+import { MEMORY_STOP_WORDS, memoryTokens as sharedMemoryTokens, textSimilarity } from './memory-text.js';
 
 // ==================== 存储布局 ====================
 // 与 kb/ 下的其它数据放在同一棵目录树里：控制台能直接浏览，备份与生命周期规则也统一。
@@ -64,14 +65,24 @@ function intEnv(env, name, def, min, max) {
   if (!(n > 0)) return def;
   return Math.max(min, Math.min(max, n));
 }
+// 与 intEnv 的区别：允许显式设 0（用于关掉 L2 同主题合并），其余仍要求正数。
+function intEnvNonNeg(env, name, def, max) {
+  const raw = String((env && env[name]) === undefined ? '' : env[name]).trim();
+  if (raw === '') return def;
+  const n = parseInt(raw, 10);
+  if (!(n >= 0)) return def;
+  return Math.min(max, n);
+}
 function limitsOf(env) {
   return {
     workTurns: intEnv(env, 'MEMORY_WORK_TURNS', DEFAULTS.workTurns, 2, 40),
     workTurnChars: intEnv(env, 'MEMORY_WORK_TURN_CHARS', DEFAULTS.workTurnChars, 80, 800),
-    workTtlMs: DEFAULTS.workTtlMs,
+    // v7.10.3：原先三个时间常量写死在 DEFAULTS 里，不同部署规模无法调。
+    // 单位沿用文档口径：小时 / 天 / 毫秒。
+    workTtlMs: intEnv(env, 'MEMORY_WORK_TTL_HOURS', 24, 1, 2160) * 3600000,
     epiMax: intEnv(env, 'MEMORY_EPISODE_MAX', DEFAULTS.epiMax, 10, 1000),
-    epiTtlMs: DEFAULTS.epiTtlMs,
-    epiMergeMs: DEFAULTS.epiMergeMs,
+    epiTtlMs: intEnv(env, 'MEMORY_EPISODE_TTL_DAYS', 180, 1, 3650) * 86400000,
+    epiMergeMs: intEnvNonNeg(env, 'MEMORY_EPISODE_MERGE_MS', DEFAULTS.epiMergeMs, 24 * 3600000),
     injectChars: intEnv(env, 'MEMORY_INJECT_CHARS', DEFAULTS.injectChars, 400, 8000),
     recallMax: intEnv(env, 'MEMORY_RECALL_MAX', DEFAULTS.recallMax, 1, 12),
   };
@@ -92,13 +103,20 @@ const memCounters = {
   workWrites: 0,
   episodesWritten: 0,
   episodesMerged: 0,
+  episodesSkipped: 0,
   recalls: 0,
   recallHits: 0,
   writeFails: 0,
   lastError: '',
 };
 function memoryDiag() {
-  return Object.assign({}, memCounters);
+  // v7.10.3：附带实例内的缓存与写锁规模。写锁长期不降说明写入卡住，
+  // 缓存 scope 数无限增长则说明作用域清洗失效——两者都是以前完全看不见的。
+  return Object.assign({}, memCounters, {
+    workCacheScopes: workCache.size,
+    episodeCacheScopes: epiCache.size,
+    activeWriteLocks: writeChains.size,
+  });
 }
 function __resetMemoryDiag() {
   for (const k of Object.keys(memCounters)) memCounters[k] = typeof memCounters[k] === 'number' ? 0 : '';
@@ -106,17 +124,9 @@ function __resetMemoryDiag() {
 
 // ==================== 文本工具：摘要与主题词 ====================
 // 停用词表：中文按「整词」与「2-gram」两种形态都要拦，否则「什么/可以/一下」会占满主题位。
-const TOPIC_STOP = new Set([
-  '的', '了', '是', '我', '你', '他', '她', '它', '们', '在', '和', '与', '就', '不', '也', '都',
-  '这', '那', '有', '吗', '呢', '啊', '吧', '呀', '把', '被', '给', '对', '从', '到', '而', '并',
-  '一个', '一下', '什么', '怎么', '怎样', '如何', '可以', '能否', '是否', '我们', '你们', '他们',
-  '这个', '那个', '这些', '那些', '现在', '然后', '就是', '还是', '没有', '因为', '所以', '如果',
-  '但是', '或者', '以及', '进行', '需要', '应该', '已经', '可能', '之后', '之前', '时候', '问题',
-  '东西', '帮我', '请问', '告诉', '一下', '一些', '这样', '那样', '自己', '知道', '觉得', '想要',
-  'the', 'and', 'for', 'with', 'that', 'this', 'you', 'are', 'was', 'have', 'has', 'but', 'not',
-  'can', 'will', 'would', 'could', 'should', 'from', 'they', 'them', 'then', 'than', 'there',
-  'what', 'when', 'where', 'which', 'who', 'how', 'why', 'all', 'any', 'our', 'out', 'get', 'got',
-]);
+// v7.10.3：停用词只保留一份（memory-text.js），L1/L2/L3 与主题词抽取共用同一口径，
+// 不再出现「某一层过滤了、另一层没过滤」的召回偏差。
+const TOPIC_STOP = MEMORY_STOP_WORDS;
 
 // 折叠空白、去掉 Markdown 标记噪音、截断。摘要要短，不能把代码块整段搬进记忆。
 function clipText(s, max) {
@@ -174,14 +184,35 @@ function extractTopics(text, limit) {
   return out;
 }
 
-// 结论句：回答的第一句往往就是结论；没有句读时取开头一段。
-// 这一句比整段回答更适合进记忆——用户回头要的是「当时怎么定的」，不是全文。
+// 结论句识别（v7.10.3）：旧实现无条件取第一句，而模型回答常以「好的，我来帮你分析一下」
+// 开场——于是 L1/L2 记下来的全是寒暄，用户回头问「上次结论是什么」得到一句废话。
+// 现在在前几句里按「结论标志 + 开场白惩罚 + 位置 + 信息量」打分选一句，仍是纯确定性抽取。
+const CONCLUSION_RE = /结论|所以|因此|总之|综上|最终|建议|推荐|答案|结果是|应该是|最好是|意味着|也就是说|需要|应当|应该|选择|决定|方案是|关键在|核心是|原因是|优先|定为|可以用/;
+const PREAMBLE_RE = /^(好的|好哒|没问题|当然|可以呀|我来|让我|首先|我们先|下面|以下|关于你|你问的|这是一个|很高兴|明白了|收到|抱歉|不好意思)/;
+
 function firstConclusion(text, max) {
   const t = clipText(text, 600);
   if (!t) return '';
-  const m = t.match(/^(.{6,}?[。！？.!?])/);
-  const s = m ? m[1] : t;
-  return clipText(s, max > 0 ? max : 160);
+  const cap = max > 0 ? max : 160;
+  const sentences = t.match(/[^。！？!?\n]+[。！？!?]?/g) || [t];
+  let best = '';
+  let bestScore = -Infinity;
+  for (let i = 0; i < sentences.length && i < 12; i++) {
+    const s = String(sentences[i] || '').trim();
+    if (s.length < 6) continue;
+    let score = 0;
+    if (CONCLUSION_RE.test(s)) score += 6;
+    if (PREAMBLE_RE.test(s)) score -= 6;
+    if (/[：:]/.test(s.slice(0, 8))) score += 2;   // 「结论：xxx」
+    score -= Math.min(3, i * 0.6);                  // 越靠后略减
+    score += Math.min(2, s.length / 60);            // 信息量
+    if (score > bestScore) { bestScore = score; best = s; }
+  }
+  if (!best) {
+    const m = t.match(/^(.{6,}?[。！？.!?])/);
+    best = m ? m[1] : t;
+  }
+  return clipText(best, cap);
 }
 
 // 判断这一轮是否「值得记一条情景记忆」。
@@ -250,7 +281,7 @@ const workExp = new Map();
 
 function emptyWork(scope) {
   const now = Date.now();
-  return { v: 1, scope: scope, startedAt: now, updatedAt: now, turns: [], topics: [], openTasks: [] };
+  return { v: 1, scope: scope, startedAt: now, updatedAt: now, turns: [], topics: [], openTasks: [], carried: '' };
 }
 
 function normalizeWork(raw, scope) {
@@ -266,6 +297,8 @@ function normalizeWork(raw, scope) {
     turns: turns,
     topics: Array.isArray(raw.topics) ? raw.topics.filter(x => typeof x === 'string').slice(0, 12) : [],
     openTasks: Array.isArray(raw.openTasks) ? raw.openTasks.filter(x => typeof x === 'string').slice(0, 8) : [],
+    // v7.10.3：上一场会话翻篇时带过来的结论摘要（不额外写 L2，也不会跨用户串号）。
+    carried: clipText(raw.carried || '', 320),
   };
 }
 
@@ -284,7 +317,13 @@ async function getWorking(env, chatId, opts) {
   if (work) {
     const ttl = limitsOf(env).workTtlMs;
     if (Date.now() - (work.updatedAt || 0) > ttl) {
-      work = { v: 1, scope: scope, startedAt: Date.now(), updatedAt: Date.now(), turns: [], topics: work.topics.slice(0, 6), openTasks: [] };
+      // v7.10.3：翻篇不等于失忆。旧实现直接把 turns 全丢，24 小时后用户问
+      //「上次我们定了什么」时 L1 已空、L2 又未必记过那一轮，答案就凭空消失。
+      // 现在把上场会话的结论压成一段 carried 摘要带进新会话，不额外产生 R2 写入。
+      const oldConclusions = (work.turns || []).map(t => String(t.ai || '').trim()).filter(Boolean);
+      const carried = oldConclusions.length ? clipText(oldConclusions.slice(-6).join('；'), 320) : '';
+      work = { v: 1, scope: scope, startedAt: Date.now(), updatedAt: Date.now(),
+        turns: [], topics: work.topics.slice(0, 6), openTasks: [], carried: carried };
     }
   }
   if (work) mapSetBounded(workCache, scope, work, undefined, workExp);
@@ -453,7 +492,12 @@ async function appendEpisode(env, chatId, digest) {
     const title = clipText(digest.user || digest.ai, 50);
     const summary = clipText(digest.ai || digest.user, 320);
     const last = items.length ? items[items.length - 1] : null;
-    if (last && now - last.ts <= lim.epiMergeMs && topicOverlap(digest.topics || [], last.topics) >= 0.5) {
+    const withinWindow = last && now - last.ts <= lim.epiMergeMs;
+    const sameTopic = withinWindow && topicOverlap(digest.topics || [], last.topics) >= 0.5;
+    // v7.10.3：主题词抽不准、但结论几乎一样时也应合并（换个说法重问同一件事）。
+    // 否则 L2 会攒下多条内容重复的摘要，检索时互相抢位置、挤掉真正不同的经历。
+    const sameConclusion = withinWindow && textSimilarity(last.summary, summary) >= 0.9;
+    if (last && (sameTopic || sameConclusion)) {
       last.ts = now;
       last.turns = (last.turns || 1) + 1;
       last.summary = mergeSummary(last.summary, summary, 320);
@@ -537,16 +581,9 @@ function scoreEpisode(ep, qLower, qTokens, now) {
   return score + recency;
 }
 
+// v7.10.3：与 L3（memory.js）和 prompt.js 共用同一份分词。
 function queryTokens(q) {
-  const out = [];
-  for (const seg of String(q || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/)) {
-    if (!seg) continue;
-    out.push(seg);
-    if (/[\u4e00-\u9fff]/.test(seg)) {
-      for (let i = 0; i + 2 <= seg.length; i++) out.push(seg.slice(i, i + 2));
-    }
-  }
-  return [...new Set(out)].filter(t => !TOPIC_STOP.has(t));
+  return sharedMemoryTokens(q);
 }
 
 // 注入用：从情景记忆里挑出与本次提问最相关的几条。
@@ -582,7 +619,23 @@ async function recallMemory(env, chatId, query, opts) {
 
   if (layersEnabled(env)) {
     if (layer === 'all' || layer === 'work') {
-      try { out.work = await getWorking(env, chatId); } catch (e) { out.work = null; }
+      try {
+        const w = await getWorking(env, chatId);
+        // v7.10.3：L1 也做相关性过滤。旧实现无条件把整份工作记忆塞进结果，
+        // 只要聊过几句，任何无关查询都会 ok:true 并甩出一堆无关历史，
+        // 「查不到就如实说没有」的诚实约束形同虚设。这里逐轮判断，只留命中的轮次。
+        if (w && w.turns && w.turns.length) {
+          if (!q) out.work = w;
+          else {
+            const hitTurns = w.turns.filter(t => {
+              const s = (String(t.user || '') + ' ' + String(t.ai || '') + ' '
+                + (t.topics || []).join(' ')).toLowerCase();
+              return s.indexOf(qLower) !== -1 || qTokens.some(tok => tok && s.indexOf(tok) !== -1);
+            });
+            if (hitTurns.length) out.work = Object.assign({}, w, { turns: hitTurns });
+          }
+        }
+      } catch (e) { out.work = null; }
     }
     if (layer === 'all' || layer === 'episodic' || layer === 'epi') {
       try {
@@ -616,6 +669,7 @@ function formatRecallResult(r) {
     for (const t of r.work.turns.slice(-4)) {
       lines.push('- ' + fmtClock(t.ts) + ' 用户问：' + t.user + (t.ai ? ' → 结论：' + t.ai : ''));
     }
+    if (r.work.carried) lines.push('- 上一场会话的结论：' + clipText(r.work.carried, 160));
     if (r.work.openTasks && r.work.openTasks.length) {
       lines.push('- 未完成：' + r.work.openTasks.slice(0, 3).join('；'));
     }
@@ -709,14 +763,21 @@ function memKindLabel(kind) {
 // L1 只给「主题 + 最近结论 + 未完成」，不重复原始对话：
 // 原始历史已经在 messages 里，再抄一遍既费 token 又容易让模型以为有两份对话。
 function formatWorkingBlock(work, budget) {
-  if (!work || !work.turns || !work.turns.length) return '';
+  const hasTurns = !!(work && work.turns && work.turns.length);
+  const carried = work ? String(work.carried || '') : '';
+  // v7.10.3：翻篇后 turns 为空但 carried 有内容，绝不能在这里提前 return ——
+  // 否则那段「上一场会话的结论」永远注入不出去，等于白存。
+  if (!hasTurns && !carried) return '';
   const cap = budget > 0 ? budget : 900;
   const lines = [];
-  lines.push('【L1 会话工作记忆】（本次对话已 ' + work.turns.length + ' 轮，最近更新 '
-    + fmtClock(work.updatedAt || work.turns[work.turns.length - 1].ts) + '；'
+  lines.push('【L1 会话工作记忆】（' + (hasTurns
+    ? '本次对话已 ' + work.turns.length + ' 轮，最近更新 '
+      + fmtClock(work.updatedAt || work.turns[work.turns.length - 1].ts)
+    : '上一场会话已翻篇，保留跨会话结论') + '；'
     + '原始对话可能已被裁剪，这里是保留的要点）');
   if (work.topics && work.topics.length) lines.push('主题：' + work.topics.slice(0, 8).join('、'));
-  const recent = work.turns.slice(-3);
+  if (carried) lines.push('上一场会话的结论：' + clipText(carried, 120));
+  const recent = hasTurns ? work.turns.slice(-3) : [];
   for (const t of recent) {
     const line = '- ' + fmtClock(t.ts) + ' 用户问「' + t.user + '」→ ' + (t.ai || '（无结论）');
     if (lines.join('\n').length + line.length > cap) break;
@@ -776,6 +837,10 @@ async function recordTurnMemory(env, chatId, turn, opts) {
       // Web 端 L1 跟会话（web_<sid>）、L2 跟浏览器（webu_<client_id>），
       // 否则「换个新对话」就等于把过往经历全丢了。
       out.episode = await appendEpisode(env, opts.episodeScope || chatId, digest);
+    } else if (opts.episode !== false) {
+      // 闲聊轮不写 L2 是预期行为，但「一条都没写」和「被判定为不值得写」要能在
+      // /healthz 里区分开，否则排障时只会看到 episodesWritten 一直是 0。
+      memCounters.episodesSkipped++;
     }
     memCounters.turnsRecorded++;
   } catch (e) {
@@ -830,15 +895,21 @@ async function memoryReport(env, chatId, opts) {
     if (showItems) {
       for (const t of work.turns.slice(-3)) lines.push('  · ' + fmtClock(t.ts) + ' ' + clipText(t.user, 60));
     }
+    if (work.carried) lines.push('  · 上场会话结论：' + clipText(work.carried, 80));
     if (work.openTasks.length) lines.push('  · 未完成：' + work.openTasks.slice(0, 2).join('；'));
   } else {
-    lines.push('【L1 工作记忆】本次会话暂无记录');
+    lines.push('【L1 工作记忆】本次会话暂无记录'
+      + (work && work.carried ? '（上场会话结论：' + clipText(work.carried, 80) + '）' : ''));
   }
   // L2
   lines.push('【L2 情景记忆】共 ' + episodes.length + ' 条'
     + (episodes.length ? '（保留最近 180 天）' : ''));
   if (showItems && episodes.length) {
-    for (const e of episodes.slice(-3).reverse()) lines.push('  · ' + fmtDate(e.ts) + '《' + e.title + '》');
+    for (const e of episodes.slice(-3).reverse()) {
+      // v7.10.3：只给标题时用户看不出「这条到底记了什么」，补一小段结论摘要。
+      lines.push('  · ' + fmtDate(e.ts) + '《' + e.title + '》'
+        + (e.summary ? '：' + clipText(e.summary, 64) : ''));
+    }
   }
   // L3：条数用真实总数（semTotal），列表只用前 30 条。
   // 旧写法直接用检索结果的长度当「共 N 条」，而检索本身有 limit，
@@ -847,7 +918,8 @@ async function memoryReport(env, chatId, opts) {
     + (semStat.max > 0 ? '（上限 ' + semStat.max + '）' : ''));
   if (showItems && sem.length) {
     for (let i = 0; i < sem.length; i++) {
-      lines.push('  ' + (i + 1) + '. ' + sem[i].fact);
+      const k = sem[i].kind && sem[i].kind !== 'fact' ? '［' + memKindLabel(sem[i].kind) + '］' : '';
+      lines.push('  ' + (i + 1) + '. ' + k + sem[i].fact);
     }
     if (semTotal > sem.length) lines.push('  …（其余 ' + (semTotal - sem.length) + ' 条可用 /recall 关键词 检索）');
   }

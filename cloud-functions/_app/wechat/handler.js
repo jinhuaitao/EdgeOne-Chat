@@ -1446,6 +1446,16 @@ async function processWechatMessage(env, creds, rawMsg) {
 const WX_LOCK_DEFAULT_TTL_MS = 16000;
 const WX_MIN_FULL_POLL_MS = 4000;
 const WX_DEFAULT_LONGPOLL_MS = 11500;
+// 单轮长轮询预算：与 README 的 WX_POLL_BUDGET_MS 默认值保持一致（25000ms）。
+const WX_DEFAULT_POLL_BUDGET_MS = 25000;
+// 自接力守护链的安全闸门（v7.10.2）：默认最多接力 120 棒（约 50 分钟），到点自然停链，
+// 由下一次真实请求 / 外部监控 ping 重新唤醒。Serverless 按调用计费且实例随时可回收，
+// 无限自循环既不可靠也不经济。设 WX_RELAY_MAX_HOPS=0 可显式恢复无限接力。
+const WX_RELAY_MAX_HOPS_DEFAULT = 120;
+const WX_RELAY_MIN_INTERVAL_MS_DEFAULT = 2000;
+const WX_RELAY_HARD_CAP_PER_ISOLATE = 600;
+let lastRelayAt = 0;
+let relayCallsInIsolate = 0;
 let lastNotifyStartAt = 0;
 
 async function isPollLockHeld(env) {
@@ -1568,7 +1578,7 @@ async function runWechatPollCycle(env, opts) {
   }
 
   const longPollTimeoutMs = Math.min(Math.max(parseInt(opts.longPollTimeoutMs || env.WX_LONGPOLL_TIMEOUT_MS || String(WX_DEFAULT_LONGPOLL_MS), 10) || WX_DEFAULT_LONGPOLL_MS, WX_MIN_FULL_POLL_MS), 18000);
-  const maxRuntimeMs = Math.min(Math.max(parseInt(opts.maxRuntimeMs || env.WX_POLL_BUDGET_MS || '24000', 10) || 24000, longPollTimeoutMs + 1000), 85000);
+  const maxRuntimeMs = Math.min(Math.max(parseInt(opts.maxRuntimeMs || env.WX_POLL_BUDGET_MS || String(WX_DEFAULT_POLL_BUDGET_MS), 10) || WX_DEFAULT_POLL_BUDGET_MS, longPollTimeoutMs + 1000), 85000);
   const maxRounds = Math.min(Math.max(parseInt(opts.maxRounds || '2', 10) || 2, 1), 8);
 
   if (!(await acquirePollLock(env, longPollTimeoutMs + 3500, !!opts.force))) {
@@ -1720,10 +1730,33 @@ async function runWechatPollCycle(env, opts) {
 // 引擎 B：容器内 `+600ms` 定时器常驻续跑（无论公网接力是否受同域限制，只要 600ms 后锁未被新实例接管，当前常驻容器立刻无缝续跑下一轮 24s 周期！）。
 async function triggerNextSelfRelay(env, origin, hop, ctx) {
   try {
+    const currentHop = Math.max(0, parseInt(hop, 10) || 0);
+    // 闸门 1：棒数上限。hop 线性递增（不再 % 10000 回绕），到点就停链。
+    // 停链不等于失联：任何一次真实请求 / 监控 ping 都会经 maybeWakeWxDaemon 重新唤醒。
+    const maxHops = (() => {
+      const v = parseInt(env && env.WX_RELAY_MAX_HOPS, 10);
+      return Number.isFinite(v) && v >= 0 ? Math.min(v, 10000) : WX_RELAY_MAX_HOPS_DEFAULT;
+    })();
+    if (maxHops > 0 && currentHop >= maxHops) {
+      console.log('[wx-relay] 自接力已达上限 ' + maxHops + ' 棒，本轮停链；下次请求会自动唤醒');
+      return;
+    }
+    // 闸门 2：最小间隔，兜住异常情况下的紧密自请求风暴。
+    const minInterval = (() => {
+      const v = parseInt(env && env.WX_RELAY_MIN_INTERVAL_MS, 10);
+      return Number.isFinite(v) && v >= 0 ? Math.min(v, 60000) : WX_RELAY_MIN_INTERVAL_MS_DEFAULT;
+    })();
+    const now = Date.now();
+    if (minInterval > 0 && now - lastRelayAt < minInterval) return;
+    // 闸门 3：isolate 生命周期内的绝对次数上限，兜住 WX_RELAY_MAX_HOPS=0 的显式无限模式。
+    if (relayCallsInIsolate >= WX_RELAY_HARD_CAP_PER_ISOLATE) return;
+    lastRelayAt = now;
+    relayCallsInIsolate += 1;
+
     const creds = await getWxCredentials(env);
     if (!creds || !creds.bot_token || creds.expired) return;
     const effOrigin = isRealPublicOrigin(origin) ? origin : (isRealPublicOrigin(creds.relay_origin) ? creds.relay_origin : lastKnownPublicOrigin);
-    const nextHop = ((parseInt(hop, 10) || 0) + 1) % 10000;
+    const nextHop = currentHop + 1;
 
     // 引擎 A：公网 HTTP 唤醒下一棒实例（下游立即返回 200 OK JSON，耗时仅 ~50-200ms）
     if (isRealPublicOrigin(effOrigin)) {
@@ -1742,14 +1775,15 @@ async function triggerNextSelfRelay(env, origin, hop, ctx) {
       } catch (e) {}
     }
 
-    // 引擎 B：始终注册容器内 +600ms 兜底定时器（若引擎 A 因同域子请求上限等原因未能拿到锁，当前常驻进程立刻接管继续无限循环！）
+    // 引擎 B：注册容器内 +600ms 兜底定时器（若引擎 A 因同域子请求上限等原因未能拿到锁，
+    // 当前常驻进程接管下一棒）。它同样受上面的棒数 / 间隔 / 次数闸门约束，不再是无限循环。
     const inProcessChain = new Promise(resolve => {
       const t = setTimeout(resolve, 600);
       if (t && typeof t.unref === 'function') t.unref();
     }).then(async () => {
       if (await isPollLockHeld(env)) return;
       await runWechatPollCycle(env, {
-        maxRuntimeMs: 24000,
+        maxRuntimeMs: WX_DEFAULT_POLL_BUDGET_MS,
         longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
         maxRounds: 2,
         singleShot: false,
@@ -1771,7 +1805,7 @@ function kickWxAutoDaemon(env, ctx, origin) {
   const task = (async () => {
     if (await isPollLockHeld(env)) return;
     await runWechatPollCycle(env, {
-      maxRuntimeMs: 24000,
+      maxRuntimeMs: WX_DEFAULT_POLL_BUDGET_MS,
       longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
       maxRounds: 2,
       singleShot: false,
@@ -1853,9 +1887,9 @@ async function handleWxWebhook(request, env, url, ctx) {
       const hop = parseInt((payload && payload.hop) || reqUrl.searchParams.get('hop') || '1', 10) || 1;
       if (isRelay) {
         // 关键设计：立即返回完整 200 OK JSON 响应，使上游父请求在 5ms 内干净结束 HTTP 事务（绝不在父请求退出时向本实例发送 TCP RST 断开信号！）；
-        // 同时将本实例的轮询严格控制在 24 秒（2 轮 × 11.5s，小于 waitUntil 30 秒硬限制），在第 24 秒准时触发下一棒！
+        // 同时将本实例的轮询严格控制在 25 秒（2 轮 × 11.5s，小于 waitUntil 30 秒硬限制），在第 25 秒左右触发下一棒。
         const relayCycleTask = runWechatPollCycle(env, {
-          maxRuntimeMs: 24000,
+          maxRuntimeMs: WX_DEFAULT_POLL_BUDGET_MS,
           longPollTimeoutMs: WX_DEFAULT_LONGPOLL_MS,
           maxRounds: 2,
           singleShot: false,

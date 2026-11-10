@@ -235,9 +235,10 @@ async function toolWebFetch(url, offset) {
     let current = url;
     let res = null;
     for (let hop = 0; hop <= 5; hop++) {
-      let fetchHost = '';
-      try { fetchHost = new URL(current).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
-      if (isBlockedFetchHost(fetchHost)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
+      let hopUrl;
+      try { hopUrl = new URL(current); } catch (e) { return 'URL 非法，仅支持 http/https'; }
+      if (hopUrl.protocol !== 'http:' && hopUrl.protocol !== 'https:') return 'URL 非法，仅支持 http/https';
+      if (isBlockedFetchHost(hopUrl.hostname)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
       res = await fetch(current, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
         signal: ctrl.signal, redirect: 'manual'
@@ -246,7 +247,11 @@ async function toolWebFetch(url, offset) {
         const loc = res.headers.get('location');
         try { if (res.body) await res.body.cancel(); } catch (e) {}
         if (!loc) return '抓取失败：重定向缺少目标地址';
-        try { current = new URL(loc, current).href; } catch (e) { return '抓取失败：重定向地址非法'; }
+        try {
+          const nextUrl = new URL(loc, current);
+          if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') return '抓取失败：重定向协议不支持';
+          current = nextUrl.href;
+        } catch (e) { return '抓取失败：重定向地址非法'; }
         continue;
       }
       break;

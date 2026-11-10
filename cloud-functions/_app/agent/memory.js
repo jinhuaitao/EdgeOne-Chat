@@ -14,6 +14,7 @@ import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import { agentMemKey, agentMemKeyLegacy, kbMemDir, kbNewMemFile, kbMemMarkdown,
   kbBackfillMd, kbDeleteKeys, kbSafeChatId } from '../store/kb.js';
+import { memoryTokens as sharedMemoryTokens } from './memory-text.js';
 
 // ==================== Telegram Agent：长期记忆 + 开关 ====================
 const tgAgentMemCache = new Map();
@@ -59,13 +60,21 @@ function memNorm(fact) {
 // 不做主题判断（保守起步：宁可多存一条，不可误删用户事实）。
 function memSubjectKey(fact) {
   const s = memNorm(fact);
+  // v7.10.3：先把 URL 协议里的冒号掩码掉（等长替换，索引仍然对齐）。
+  // 旧实现取第一个 ':' ——「https://a.com 是我的博客」的 subject 会退化成 "https"，
+  // 于是所有网址开头的记忆互相覆盖，用户事实被悄悄删掉。
+  const masked = s.replace(/[a-z][a-z0-9+.-]*:\/\//g, m => '\u0000'.repeat(m.length));
   let idx = -1;
   for (const d of ['是', '为', ':', '：', '=', '＝']) {
-    const i = s.indexOf(d);
+    const i = masked.indexOf(d);
     if (i !== -1 && (idx === -1 || i < idx)) idx = i;
   }
   if (idx < 2) return null;
-  return s.slice(0, idx);
+  const key = s.slice(0, idx);
+  // 纯数字/符号前缀（「10:30 是我的闹钟」→ "10"）不能当主题，否则同一时间格式的
+  // 所有条目会被判成同一主题。至少要有中文或 2 个以上连续字母才算有效主语。
+  if (!/[\u4e00-\u9fff]/.test(key) && !/[a-z]{2,}/.test(key)) return null;
+  return key;
 }
 
 // 归一化单条记忆：补齐 v7.10.0 新增字段（kind/tags/hits/lastUsed）。
@@ -231,7 +240,9 @@ async function agentForgetMemory(env, chatId, keyword) {
   keyword = String(keyword || '').trim();
   if (!keyword) return { removed: 0 };
   const arr = await agentGetMemories(env, chatId);
-  const kept = arr.filter(m => String(m.fact || '').indexOf(keyword) < 0);
+  // v7.10.3：与 memNorm 去重口径一致，英文关键词不该因为大小写漏删。
+  const kwLower = keyword.toLowerCase();
+  const kept = arr.filter(m => String(m.fact || '').toLowerCase().indexOf(kwLower) < 0);
   const removed = arr.length - kept.length;
   if (removed > 0) {
     // v6.6.7：同步删除被删条目的 md 镜像
@@ -258,16 +269,10 @@ async function agentForgetMemory(env, chatId, keyword) {
 
 // ==================== L3 检索与使用度 ====================
 // 分词与 prompt.js 的记忆打分口径保持一致（英文按词、中文按 2-gram，中文不拆单字）。
+// v7.10.3：统一到 memory-text.js（含停用词与纯虚词 2-gram 过滤）。
+// 保留同名导出，老调用方与自检不受影响。
 function memTokens(s) {
-  const out = [];
-  for (const seg of String(s || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/)) {
-    if (!seg) continue;
-    out.push(seg);
-    if (/[\u4e00-\u9fff]/.test(seg)) {
-      for (let i = 0; i + 2 <= seg.length; i++) out.push(seg.slice(i, i + 2));
-    }
-  }
-  return [...new Set(out)];
+  return sharedMemoryTokens(s);
 }
 
 // 单条打分：关键词命中为主，新近度与使用次数为辅。
@@ -317,11 +322,13 @@ async function agentTouchMemories(env, chatId, facts) {
   const list = Array.isArray(facts) ? facts.filter(f => typeof f === 'string' && f) : [];
   if (!list.length || !env || !env.R2) return false;
   const arr = await agentGetMemories(env, chatId);
-  const set = new Set(list);
+  // v7.10.3：按归一化文本匹配。recall 返回的 fact 可能与索引里的写法有空白差异，
+  // 以前用精确字符串比较会静默漏记「这条记忆被用过」，容量淘汰随之失真。
+  const set = new Set(list.map(memNorm));
   let changed = false;
   const now = Date.now();
   for (const m of arr) {
-    if (set.has(m.fact)) { m.hits = (m.hits || 0) + 1; m.lastUsed = now; changed = true; }
+    if (set.has(memNorm(m.fact))) { m.hits = (m.hits || 0) + 1; m.lastUsed = now; changed = true; }
   }
   if (!changed) return false;
   mapSetBounded(tgAgentMemCache, chatId, arr.slice(), undefined, tgAgentMemExp);
@@ -341,8 +348,15 @@ function formatSemanticBlock(memories, query, budget) {
     s: q ? scoreMemoryItem(m, qTokens, now) : ((m.ts || 0) / 1e6),
     hit: q ? memKeywordHits(m, qTokens) : true,
   }));
-  const picked = q ? scored.filter(x => x.hit) : scored;
-  picked.sort((a, b) => b.s - a.s);
+  // v7.10.3：长期要求（instruction）不看关键词命中，也不参与排序竞争 ——
+  // 它是「每轮都要生效」的约束。旧实现里问一句「今天天气」就会把它过滤掉，
+  // 用户明明设过「回答先给结论」，普通聊天模式却完全不生效。
+  const picked = q ? scored.filter(x => x.hit || x.m.kind === 'instruction') : scored;
+  picked.sort((a, b) => {
+    const ai = a.m.kind === 'instruction' ? 1 : 0;
+    const bi = b.m.kind === 'instruction' ? 1 : 0;
+    return (bi - ai) || (b.s - a.s);
+  });
   let left = budget > 0 ? budget : 1200;
   const lines = [];
   for (const x of picked) {

@@ -379,11 +379,21 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   // 不少通道默认 1.0，表现为参数漏字段、爱在 tool_calls 前后写解释。
   // 默认 0.7，TEMPERATURE 可覆盖；推理模型（reasoner / r1 / o1 / o3）对温度敏感，
   // 部分实现只接受 1，这类模型直接不传，交给上游默认。
+  // v7.10.2：带 tools 的 Agent 请求默认再降到 AGENT_TEMPERATURE_DEFAULT。
+  // 工具选择与参数生成是「结构化决策」，0.7 的采样随机性会直接变成漏字段、
+  // 同一问题换工具、tool_calls 外包一段解释；0.3 明显更稳，且不影响普通聊天的文采。
+  // 显式 TEMPERATURE 始终优先；AGENT_TEMPERATURE 可单独调（设 0.7 即回到旧行为）。
+  const AGENT_TEMPERATURE_DEFAULT = 0.3;
+  const isToolCall = !!(tools && tools.length) && !isImageAPI;
   let temperature = null;
   const tempRaw = String(env.TEMPERATURE === undefined ? '' : env.TEMPERATURE).trim();
+  const agentTempRaw = String(env.AGENT_TEMPERATURE === undefined ? '' : env.AGENT_TEMPERATURE).trim();
   if (tempRaw !== '') {
     const t = parseFloat(tempRaw);
     if (t >= 0 && t <= 2) temperature = t;
+  } else if (isToolCall) {
+    const t = parseFloat(agentTempRaw);
+    temperature = (agentTempRaw !== '' && t >= 0 && t <= 2) ? t : AGENT_TEMPERATURE_DEFAULT;
   } else {
     temperature = 0.7;
   }

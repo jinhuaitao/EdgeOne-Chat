@@ -24,6 +24,7 @@ import { getAgentTools, execAgentTool, getAgentToolCacheStats } from './tools.js
 import { agentGetMemories } from './memory.js';
 import { getWorking, getEpisodes, pickRelevantEpisodes, recordTurnMemory, layersEnabled } from './memory-layers.js';
 import { buildAgentSystemPrompt, buildPromptToolManual } from './prompt.js';
+import { buildAccuracyHint, precomputeArithmetic } from './accuracy.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { kbPrefetch } from '../kb/prefetch.js';
 
@@ -55,6 +56,9 @@ const turnStats = {
   promptCharsTotal: 0,
   promptTokensTotal: 0,
   completionTokensTotal: 0,
+  // v7.10.2：确定性算式预计算的采纳率 —— 判断准确率增强是否真的落到答案里。
+  arithmeticHintedTotal: 0,
+  arithmeticAdoptedTotal: 0,
   lastStopReason: '',
   lastElapsedMs: 0,
 };
@@ -70,6 +74,7 @@ function newTurnStats() {
     // v7.10.0：本轮用过哪些工具、存过哪些文档 —— 情景记忆的「线索」，
     // 让以后能回答「上次我们是查了哪些资料才定的」。
     toolNames: [], docTitles: [],
+    arithmeticHinted: 0, arithmeticAdopted: 0,
   };
 }
 
@@ -87,6 +92,8 @@ function commitTurnStats(stats, r) {
     turnStats.promptCharsTotal += stats.promptChars || 0;
     turnStats.promptTokensTotal += stats.promptTokens || 0;
     turnStats.completionTokensTotal += stats.completionTokens || 0;
+    turnStats.arithmeticHintedTotal += stats.arithmeticHinted || 0;
+    turnStats.arithmeticAdoptedTotal += stats.arithmeticAdopted || 0;
     if (r && r.paused) turnStats.pausedTurns += 1;
     if (stopReason === 'time_budget') turnStats.timedOutTurns += 1;
     turnStats.lastStopReason = stopReason;
@@ -102,6 +109,8 @@ function commitTurnStats(stats, r) {
         promptChars: stats.promptChars || 0,
         promptTokens: stats.promptTokens || 0,
         completionTokens: stats.completionTokens || 0,
+        arithmeticHinted: stats.arithmeticHinted || 0,
+        arithmeticAdopted: stats.arithmeticAdopted || 0,
       };
     }
   } catch (e) {}
@@ -123,6 +132,11 @@ function agentTurnStats() {
     avgPromptChars: avg(t.promptCharsTotal),
     promptTokens: t.promptTokensTotal,
     completionTokens: t.completionTokensTotal,
+    // 只统计「注入过预计算结果」的那些轮：0 命中时返回 null，避免和「全部答错」混淆。
+    arithmeticHinted: t.arithmeticHintedTotal,
+    arithmeticAdoptRate: t.arithmeticHintedTotal > 0
+      ? Math.round((t.arithmeticAdoptedTotal / t.arithmeticHintedTotal) * 100) / 100
+      : null,
     lastStopReason: t.lastStopReason || '',
     lastElapsedMs: t.lastElapsedMs,
     cache,
@@ -139,6 +153,8 @@ function __resetAgentTurnStats() {
   turnStats.promptCharsTotal = 0;
   turnStats.promptTokensTotal = 0;
   turnStats.completionTokensTotal = 0;
+  turnStats.arithmeticHintedTotal = 0;
+  turnStats.arithmeticAdoptedTotal = 0;
   turnStats.lastStopReason = '';
   turnStats.lastElapsedMs = 0;
 }
@@ -265,6 +281,14 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     ? { work: workMem, episodes: pickRelevantEpisodes(episodes, query, 3), budget: opts && opts.memoryInjectChars }
     : null;
   let systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbPrefetchText, layered);
+  // v7.10.2：本轮准确性约束（确定性算式预计算 + 按提问意图生成的一轮性规则）。
+  // allowTools=false 的纯聊天 / 降级轮不注入「必须调工具」类指令，只保留已核验结果与诚实要求。
+  // AGENT_ACCURACY_HINT=0 可整体关闭，便于 A/B 对比这项增强的真实收益。
+  const accuracyOn = String((env && env.AGENT_ACCURACY_HINT) || '1') !== '0';
+  const precomputed = accuracyOn ? precomputeArithmetic(query) : [];
+  if (accuracyOn) {
+    systemPrompt += buildAccuracyHint(query, { toolsAvailable: !!allowTools, precomputed });
+  }
   // 降级模式：通道 400 拒绝 tools 参数时，把工具清单与调用格式写进提示词，
   // 由模型用 DSML 文本格式发起调用（loop 里原本就有 DSML 解析，这里只是让它有输入）。
   // 旧实现遇到这种通道直接 allowTools=false —— 用户拿到的是一个"没有工具"的答案，
@@ -282,6 +306,12 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText, stats,
     !!(opts && opts.promptTools), memScope);
+  // 不改答案，只记录「预计算结果有没有被模型采纳」—— 这是准确率增强的可观测指标。
+  if (precomputed.length && !(r && r.fallback) && !(r && r.error)) {
+    const answer = String((r && r.text) || '');
+    stats.arithmeticHinted = precomputed.length;
+    stats.arithmeticAdopted = precomputed.filter((x) => answer.indexOf(x.value) !== -1).length;
+  }
   // fallback 表示「这个通道不支持 tools」，会立刻用不带工具的方式重跑一遍；
   // 那一轮不计入统计，否则 avgSteps 会被一堆 0 步的降级轮稀释。
   if (!(r && r.fallback)) commitTurnStats(stats, r);
