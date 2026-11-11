@@ -643,6 +643,8 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 
 | 25 | `agent/memory-text.js`（新增）、`agent/memory.js`、`agent/memory-layers.js`、`agent/prompt.js`、`entry.js`、`scripts/selfcheck.mjs` | **三层记忆完善（v7.10.3）**：① 新增共用文本模块，统一 L1/L2/L3 与系统提示词四处分词口径（停用词 + 纯虚词 2-gram 过滤），修掉「无关条目因中文虚词被判为相关」；② **L1 召回补上相关性过滤**——旧实现只要聊过几句，任何无关查询都会返回整份工作记忆并 `ok:true`，「查不到就说没有」形同虚设；③ L1 翻篇不再丢结论：把上场会话要点压成 `carried` 带进新会话并注入提示词；④ 结论句识别跳过「好的，我来帮你…」等开场白，优先真正的结论；⑤ **长期要求（instruction）在 Agent 与普通聊天两种模式都强制注入**——旧实现普通聊天按关键词过滤，问一句「今天天气」就会把「回答先给结论」丢掉；⑥ L2 主题词抽不准但结论相同时也能合并，不攒重复摘要；⑦ 三个时间常量改为可配（`MEMORY_WORK_TTL_HOURS` / `MEMORY_EPISODE_TTL_DAYS` / `MEMORY_EPISODE_MERGE_MS`）；⑧ 修三个数据正确性 bug：`memSubjectKey` 把 URL/时间冒号当分隔符导致 L3 事实互相覆盖、`agentForgetMemory` 大小写敏感、Web 普通模式 `tee()` 写回纯 fire-and-forget 会丢记忆（改为注册 `ctx.waitUntil`）；⑨ `/memory` 报告补 L2 摘要与 L3 类型标签，`/healthz` 增缓存/写锁/跳过计数；⑩ 自检 254 → **266 项** |
 
+| 26 | `utils.js`、`channel.js`、`entry.js`、`agent/memory-layers.js`、`telegram/handler.js`、`wechat/handler.js`、`scripts/selfcheck.mjs` | **修复线上 JSON 解析事故（v7.10.4）**：上游报 `JSON syntax error: ... messages[0].content: unexpected end of hex escape at line 1 column 8887`。根因是按 UTF-16 code unit 截断把 emoji 切成半个代理项，`JSON.stringify` 输出 `\udXXX` 转义——Node/V8 能容忍，但 vLLM / SGLang / llama.cpp 等严格 C++ 解析器读到孤立高代理项后会期待紧跟一个 `\uXXXX` 低代理项，等不到就报错。① `utils.js` 新增 `safeSlice` / `stripLoneSurrogates`；② 记忆 `clipText`、Web SSE 旁路、Telegram / 微信长消息分段改用安全截断，`normalizeWork` 读入历史脏数据时清理；③ `buildAIRequest` 出口对所有外发 `content`、多模态 `text` / `image_url`、`tool_calls.arguments`、`reasoning_content`、图片 `prompt` 兜底清理；④ `formatLayeredMemory` 输出再兜一次。自检 266 → **274 项** |
+
 **除上表列出的文件外，其余模块均为原样移植**（v7.10.2 起 SSRF 防护、图片链路与服务端工具实现也做了安全加固，见第 24 行）。
 
 ---
@@ -701,7 +703,7 @@ curl -i -X POST https://<你的域名>/tg-webhook \
 node scripts/selfcheck.mjs      # 或 npm run selfcheck
 ```
 
-覆盖 **266 项用例**（21 个分组）：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
+覆盖 **274 项用例**（22 个分组）：模块图加载、R2 契约在双后端的一致性、一致性断言（`strong`
 是否真带上）、错误可见性（`QUOTA_EXCEEDED` 记录但不破坏上层）、KV key 编码、
 路由、模型解析、Blob 默认后端与命名空间自动创建、KV 绑定自动发现、
 `/healthz` 排障输出、生图链路（含 5 种响应形态）、页面内联脚本合法性、
@@ -749,7 +751,10 @@ L2 同主题合并与容量上限、按关键词删除、**跨层召回带层标
 以及 v7.10.3 的三层记忆完善（**三层分词口径统一且虚词 2-gram 被过滤**、结论句跳过开场白、
 **L1 翻篇携带上场会话结论**、**L1 召回相关性过滤**、**长期要求在两种模式都强制注入**、
 L2 同结论合并、**URL / 时间冒号不再导致 L3 事实互相覆盖**、forget 大小写无关、
-touch 归一化匹配、三个时间常量可配、翻篇与 `waitUntil` 写回的端到端断言）。
+touch 归一化匹配、三个时间常量可配、翻篇与 `waitUntil` 写回的端到端断言），
+以及 v7.10.4 的外发请求体 Unicode 安全（**代理项安全截断**、孤立代理项清理、
+**复现 8.8k system 提示词里的半个 emoji 并断言请求体零畸形转义**、
+多模态 / `tool_calls` / `reasoning_content` / 图片 prompt 兜底、Telegram 与微信分段不切坏 emoji）。
 
 本地起服务调试（需 `npm i -g edgeone`）：`edgeone makers dev`
 
@@ -834,6 +839,7 @@ node scripts/eval-agent.mjs        # 或 npm run eval
 | `/recall` 总返回一堆无关历史 | v7.10.3 起 L1 也做相关性过滤，三层停用词口径统一。仍出现多半是查询词太泛（如「怎么弄」），换具体名词 |
 | 存网址 / 带时间的记忆时被莫名覆盖 | v7.10.3 已修：`memSubjectKey` 旧版把 URL 与 `10:30` 里的冒号当主题分隔符，导致同类条目互相覆盖 |
 | 想确认记忆写回真的在跑 | `STORAGE_DEBUG=1` 看 `/healthz` 的 `debug.memory`：`turnsRecorded` 应随对话增长；`episodesSkipped` 是「判定为闲聊不写 L2」的轮数；`writeFails` 非 0 说明 Blob 写入有问题 |
+| 上游报 `JSON syntax error: unexpected end of hex escape`（指向 `messages[0].content`） | 聊天里的 emoji 被按 UTF-16 code unit 截断成半个代理项，`\udXXX` 转义让 vLLM / SGLang / llama.cpp 的严格解析器炸掉（Node 本地测不出来）。**v7.10.4 已全链路修复，重新部署即可**；旧会话里已落盘的脏记忆会在读入时自动清理。若仍出现，先确认 `/help` 显示版本 ≥ 7.10.4，再按报错的 `column` 定位原始请求体里的字符 |
 
 ### 路由约定（部署前确认）
 

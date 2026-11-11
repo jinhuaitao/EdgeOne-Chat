@@ -3935,6 +3935,101 @@ async function main() {
     }
   });
 
+  console.log('\n=== 22. 外发请求体 Unicode 安全（v7.10.4） ===');
+  const uni = await import('../cloud-functions/_app/utils.js');
+  const chanU = await import('../cloud-functions/_app/channel.js');
+  const tgU = await import('../cloud-functions/_app/telegram/handler.js');
+  const wxU = await import('../cloud-functions/_app/wechat/handler.js');
+  // 找出「\ud8xx~\udbxx 后面没有紧跟配对低代理项」的畸形转义。
+  // 这正是线上 "unexpected end of hex escape" 的元凶：Node 能解析，
+  // vLLM/SGLang/llama.cpp 的严格解析器读到这里会期待第二个 \uXXXX 却等不到。
+  const loneEsc = (body) => body.match(/\\u(d[89ab][0-9a-f]{2})(?!\\ud[c-f][0-9a-f]{2})/gi) || [];
+  const chatEnvU = { API_URL_1: 'https://up.example/v1/chat/completions', MODEL_1: 'm1', API_KEY_1: 'k' };
+
+  check('safeSlice / stripLoneSurrogates：切不坏 emoji、清得掉孤立项', () => {
+    assert.equal(uni.safeSlice('😀😀😀', 3), '😀', '切点落在代理对中间要退回一格');
+    assert.equal(uni.safeSlice('abc', 2), 'ab');
+    assert.equal(uni.safeSlice('中文', 10), '中文');
+    assert.equal(uni.stripLoneSurrogates('你好😀世界'), '你好😀世界', '正常 emoji 必须原样保留');
+    assert.equal(uni.stripLoneSurrogates('a\uD83Db'), 'ab');
+    assert.equal(uni.stripLoneSurrogates('a\uDE00b'), 'ab');
+  });
+
+  check('clipText 在 emoji 边界截断不再产出半个代理项', () => {
+    const c = memLayers.clipText('A'.repeat(119) + '😀' + '尾巴', 120);
+    assert.equal(/[\uD800-\uDFFF]/.test(c.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')), false);
+    assert.equal(loneEsc(JSON.stringify(c)).length, 0);
+  });
+
+  await checkAsync('历史脏数据：L1 turns 读入时清理孤立代理项', async () => {
+    const cid = 'mem_uni_22';
+    const old = Date.now() - 1000;
+    await r2.storePut(memEnv, memLayers.workKey(cid), JSON.stringify({
+      v: 1, scope: cid, startedAt: old, updatedAt: old,
+      turns: [{ ts: old, user: '旧问题\uD83D', ai: '结论：用容器方案\uD83D' }],
+      topics: ['部署'], openTasks: [],
+    }));
+    const w = await memLayers.getWorking(memEnv, cid);
+    assert.equal(loneEsc(JSON.stringify(w)).length, 0);
+    const layered = memLayers.formatLayeredMemory({ work: w, episodes: [] }, {});
+    assert.equal(loneEsc(JSON.stringify(layered.text)).length, 0);
+  });
+
+  await checkAsync('复现线上报错：8.8k system 提示词里的半个 emoji 不再进入请求体', async () => {
+    const sys = '【L1 会话工作记忆】\n' + 'x'.repeat(8600) + '\n'
+      + memLayers.clipText('A'.repeat(119) + '😀尾巴', 120) + '\uD83D';
+    const cfg = chanU.buildAIRequest(chatEnvU, 'm1',
+      [{ role: 'system', content: sys }, { role: 'user', content: '继续' }], true, null);
+    const body = JSON.stringify(cfg.payload);
+    assert.ok(body.length > 8000, '请求体规模应与报错 column 8887 同量级');
+    assert.equal(loneEsc(body).length, 0, '请求体不能含孤立高代理转义');
+    assert.doesNotThrow(() => JSON.parse(body));
+  });
+
+  check('多模态 content / tool_calls / reasoning_content 同样被清理', () => {
+    const msgs = [
+      { role: 'user', content: [
+        { type: 'text', text: '看图\uD83D' },
+        { type: 'image_url', image_url: { url: 'https://a.com/\uD83D.png' } },
+      ] },
+      { role: 'assistant', content: '', reasoning_content: '思考\uD83D',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'x', arguments: '{"q":"\uD83D"}' } }] },
+    ];
+    const cfg = chanU.buildAIRequest(chatEnvU, 'm1', msgs, false, null);
+    const body = JSON.stringify(cfg.payload);
+    assert.equal(loneEsc(body).length, 0);
+    assert.doesNotThrow(() => JSON.parse(body));
+    assert.equal(JSON.parse(cfg.payload.messages[1].tool_calls[0].function.arguments).q, '',
+      '清理后 tool_calls 的 JSON 参数仍要合法可解析');
+  });
+
+  check('图片接口 prompt 也过 Unicode 兜底', () => {
+    const envU = { API_URL_1: 'https://up.example/v1/images/generations', MODEL_1: 'img', API_KEY_1: 'k' };
+    const cfg = chanU.buildAIRequest(envU, 'img', [{ role: 'user', content: '画一只猫\uD83D' }], false, null);
+    assert.equal(cfg.isImageAPI, true);
+    assert.equal(loneEsc(JSON.stringify(cfg.payload)).length, 0);
+  });
+
+  check('Telegram / 微信长消息分段不在代理对中间切开', () => {
+    const s = 'a'.repeat(3979) + '😀' + 'b'.repeat(100);
+    const tgChunks = tgU.splitTelegramMarkdown(s);
+    assert.ok(tgChunks.length > 1);
+    assert.equal(loneEsc(JSON.stringify(tgChunks)).length, 0);
+    assert.ok(tgChunks.join('').indexOf('😀') !== -1, 'emoji 不能被切坏或丢掉');
+
+    const w = 'a'.repeat(3799) + '😀' + 'b'.repeat(100);
+    assert.equal(loneEsc(JSON.stringify(wxU.splitWechatText(w))).length, 0);
+  });
+
+  check('所有上游请求与 Web 旁路都接入了 Unicode 安全处理', () => {
+    const chanSrc = readSrc('cloud-functions/_app/channel.js');
+    assert.match(chanSrc, /sanitizeMessageContent\(m\.content\)/);
+    assert.match(chanSrc, /sanitizeToolCalls\(m\.tool_calls\)/);
+    const entrySrc = readSrc('cloud-functions/_app/entry.js');
+    assert.match(entrySrc, /safeSlice\(text, MEM_MIRROR_MAX_CHARS\)/);
+    assert.match(entrySrc, /return stripLoneSurrogates\(text\)/);
+  });
+
   console.log('\n=== 结果 ===');
   console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
   if (fail > 0) process.exit(1);

@@ -1,6 +1,43 @@
 // 统一解析多通道配置（带内存缓存）并构建上游 AI 请求（_worker.js 原第 19-20,1706-1821 行）
 
-import { parseCommaSeparated } from './utils.js';
+import { parseCommaSeparated, stripLoneSurrogates } from './utils.js';
+
+// ==================== 外发请求体 Unicode 兜底（v7.10.4） ====================
+// 所有通向大模型的请求都经过 buildAIRequest。孤立代理项可能来自用户输入、旧记忆、
+// 工具结果、上游流式输出或任意一处按 code unit 的截断；在这里最后清一次，
+// 保证 JSON.stringify 的结果里不会出现「\udXXX 后面没有配对低代理项」的转义，
+// 否则 vLLM / SGLang / llama.cpp 等严格解析器会报 unexpected end of hex escape。
+function sanitizeMessageContent(content) {
+  if (typeof content === 'string') return stripLoneSurrogates(content);
+  if (Array.isArray(content)) {
+    return content.map(p => {
+      if (!p || typeof p !== 'object') return p;
+      const o = Object.assign({}, p);
+      if (typeof o.text === 'string') o.text = stripLoneSurrogates(o.text);
+      if (o.image_url && typeof o.image_url === 'object' && typeof o.image_url.url === 'string') {
+        o.image_url = Object.assign({}, o.image_url, { url: stripLoneSurrogates(o.image_url.url) });
+      }
+      return o;
+    });
+  }
+  return content;
+}
+
+function sanitizeToolCalls(tcs) {
+  if (!Array.isArray(tcs)) return tcs;
+  return tcs.map(tc => {
+    if (!tc || typeof tc !== 'object') return tc;
+    const o = Object.assign({}, tc);
+    if (o.function && typeof o.function === 'object') {
+      const f = Object.assign({}, o.function);
+      if (typeof f.arguments === 'string') f.arguments = stripLoneSurrogates(f.arguments);
+      if (typeof f.name === 'string') f.name = stripLoneSurrogates(f.name);
+      o.function = f;
+    }
+    if (typeof o.id === 'string') o.id = stripLoneSurrogates(o.id);
+    return o;
+  });
+}
 
 // 优化：不再校验 env 的引用，因为函数实例生命周期内环境变量是恒定的。
 // EdgeOne 移植说明：Cloud Functions 存在实例复用场景，若在控制台改了环境变量，
@@ -416,16 +453,18 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     }
   }
 
+  lastPrompt = stripLoneSurrogates(lastPrompt);
+
   const payload = isImageAPI ? buildImagePayload(env, selectedModel, lastPrompt) : {
     model: selectedModel,
     // v6.9.0：只透传上游认识的标准字段。本地附加字段（如前端时间戳 t）
     // 不剥离的话，严格校验参数的上游会整单 400
     messages: messagesArray.map(m => {
-      const o = { role: m.role, content: m.content };
-      if (m.tool_calls) o.tool_calls = m.tool_calls;
-      if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; if (m.name) o.name = m.name; }
+      const o = { role: m.role, content: sanitizeMessageContent(m.content) };
+      if (m.tool_calls) o.tool_calls = sanitizeToolCalls(m.tool_calls);
+      if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; if (m.name) o.name = stripLoneSurrogates(m.name); }
       // v7.5.0：推理内容按模型策略决定是否回传（见 shouldEchoReasoning）
-      if (m.reasoning_content && echoReasoning) o.reasoning_content = m.reasoning_content;
+      if (m.reasoning_content && echoReasoning) o.reasoning_content = stripLoneSurrogates(m.reasoning_content);
       return o;
     }),
     stream: isStream,

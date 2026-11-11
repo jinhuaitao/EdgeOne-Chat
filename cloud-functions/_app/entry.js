@@ -27,6 +27,7 @@ import { SW_JS } from './pwa/service-worker.js';
 import { getPwaVersion } from './pwa/version.js';
 import { HTML_CONTENT } from './ui/index.js';
 import { resolveStore, ensureProvisioned, activeBackendName, storageDiagnostics, probeStore } from './store/edge-store.js';
+import { safeSlice, stripLoneSurrogates } from './utils.js';
 import { loadStoredImage, buildImageSseResponse, IMG_URL_PATH } from './images.js';
 import { kbPrefetch } from './kb/prefetch.js';
 import { agentGetMemories, formatSemanticBlock } from './agent/memory.js';
@@ -70,7 +71,8 @@ async function collectSseAssistantText(stream) {
         } catch (e) { /* 非 JSON 的心跳/注释行，忽略 */ }
       }
       if (text.length >= MEM_MIRROR_MAX_CHARS) {
-        text = text.slice(0, MEM_MIRROR_MAX_CHARS);
+        // v7.10.4：别把 emoji 切一半写进记忆，否则每轮注入提示词时都会带上畸形转义。
+        text = safeSlice(text, MEM_MIRROR_MAX_CHARS);
         break;
       }
     }
@@ -78,7 +80,7 @@ async function collectSseAssistantText(stream) {
     // 上游中途断开：已经收到的部分照样写回（半截结论也比没有强）
   }
   try { await reader.cancel(); } catch (e) {}
-  return text;
+  return stripLoneSurrogates(text);
 }
 
 // 旁路写回：调用方拿到响应后这里继续跑，不 await。

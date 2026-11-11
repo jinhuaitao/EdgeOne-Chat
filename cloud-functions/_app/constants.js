@@ -18,6 +18,11 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json / package-lock.json）
+// 7.10.4：修复线上 "JSON syntax error: unexpected end of hex escape" —— 按 code unit
+//        截断会切出半个 emoji（孤立代理项），JSON.stringify 输出 \udXXX 转义后，
+//        vLLM/SGLang/llama.cpp 等严格解析器会报 hex escape 意外结束。
+//        utils.js 新增 safeSlice / stripLoneSurrogates；记忆截断、Web SSE 旁路、
+//        Telegram/微信分段改为安全截断；buildAIRequest 出口对所有外发文本做兜底清理。
 // 7.10.3：三层记忆完善 —— 新增共用的 memory-text.js（统一分词/停用词/相似度）、
 //         L1 翻篇携带上场结论、L1 召回相关性过滤、结论句跳过开场白、
 //         instruction 在两种模式强制注入、L2 同结论合并、时间常量可配；
@@ -52,7 +57,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 7.5.0：Agent 精修 —— 时间预算治理（工具/上游超时随剩余预算收缩 + 收尾预留）、
 //        跨步重复调用熔断、无新信息检测、上下文二级压缩、reasoning_content 回传策略。
 // 7.4.0：同步新增微信 ClawBot（腾讯官方 iLink Bot API / openclaw-weixin 协议）通道支持 + 四重防盗绑安全锁。
-const APP_VERSION = '7.10.3';
+const APP_VERSION = '7.10.4';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

@@ -2,7 +2,7 @@
 // v7.4.0 增强：新增私聊专属微信 ClawBot 安全绑定命令（/wxlogin、/wxstatus、/wxunbind）
 
 import { APP_VERSION } from '../constants.js';
-import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
+import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual, safeSlice } from '../utils.js';
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
@@ -194,8 +194,10 @@ function splitTelegramMarkdown(text, maxLength = 3980) {
     if (lastNewline > 3000) {
       sliceLength = lastNewline;
     }
-    let chunk = remaining.slice(0, sliceLength);
-    remaining = remaining.slice(sliceLength);
+    // v7.10.4：按 code unit 切在 emoji 中间会让两段各自带半个代理项，
+    // 发给 Telegram 的 JSON 也就成了畸形转义。退回一格，把整个代理对留给下一段。
+    let chunk = safeSlice(remaining, sliceLength);
+    remaining = remaining.slice(chunk.length);
     const fences = chunk.match(/```[^\n]*/g);
     if (fences && fences.length % 2 === 1) {
       const lastFence = fences[fences.length - 1];

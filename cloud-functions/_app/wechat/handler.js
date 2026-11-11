@@ -15,7 +15,7 @@
 // 6) 中英双语快捷口令（菜单/帮助、模型/模型 序号、智能体/模式、画 <描述>、清空、记忆、忘掉、知识库、状态）+ 网页端会话同步与实时收发诊断日志。
 
 import { APP_VERSION, CORS_HEADERS } from '../constants.js';
-import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
+import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual, safeSlice, stripLoneSurrogates } from '../utils.js';
 import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest, fetchWithKeyRotation, authHeaders } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
@@ -484,11 +484,12 @@ async function sendWxTypingStatus(env, creds, userId, contextToken, status) {
 // ================= 5. 微信文本分段与中英双语口令解析 =================
 function splitWechatText(text, maxLength = 3800, maxChunks = 5) {
   const chunks = [];
-  let remaining = String(text || '').trim();
+  // v7.10.4：先清掉输入里本就存在的孤立代理项，再代理项安全地切片。
+  let remaining = stripLoneSurrogates(String(text || '')).trim();
   while (remaining.length > 0) {
     if (remaining.length <= maxLength || chunks.length >= maxChunks - 1) {
       if (remaining.length > maxLength * 2) {
-        chunks.push(remaining.slice(0, maxLength * 2) + '\n\n…（内容过长，已截断显示）');
+        chunks.push(safeSlice(remaining, maxLength * 2) + '\n\n…（内容过长，已截断显示）');
       } else {
         chunks.push(remaining);
       }
@@ -499,8 +500,9 @@ function splitWechatText(text, maxLength = 3800, maxChunks = 5) {
     if (lastNewline > Math.floor(maxLength * 0.7)) {
       sliceLength = lastNewline;
     }
-    const chunk = remaining.slice(0, sliceLength).trim();
-    remaining = remaining.slice(sliceLength).trim();
+    const rawChunk = safeSlice(remaining, sliceLength);
+    const chunk = rawChunk.trim();
+    remaining = remaining.slice(rawChunk.length).trim();
     if (chunk) chunks.push(chunk);
   }
   return chunks.length ? chunks : [''];

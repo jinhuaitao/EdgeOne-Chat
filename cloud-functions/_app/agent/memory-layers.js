@@ -17,7 +17,7 @@
 //   2) 写入失败绝不影响回答 —— 所有写回都 try/catch，只在 /healthz 与 /memory 里如实体现；
 //   3) 有容量与预算上限 —— 工作记忆 12 轮、情景 200 条、注入 ≤ 1800 字符，防无限膨胀。
 
-import { mapSetBounded, mapGetBounded } from '../utils.js';
+import { mapSetBounded, mapGetBounded, safeSlice, stripLoneSurrogates } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { agentSearchMemories, agentMemStats } from './memory.js';
@@ -138,11 +138,15 @@ function clipText(s, max) {
   t = t.replace(/^[ \t]*[#>*+-]+[ \t]*/gm, '');
   t = t.replace(/\s+/g, ' ').trim();
   const cap = max > 0 ? max : 240;
+  // v7.10.4：先清掉输入里本就存在的孤立代理项（可能来自前端、上游流或旧数据），
+  // 再代理项安全地截断。否则半个 emoji 会被写进 L1/L2 并每轮重新注入提示词，
+  // 上游严格 JSON 解析器会报 "unexpected end of hex escape"（见 utils.js 说明）。
+  t = stripLoneSurrogates(t);
   if (t.length <= cap) return t;
   // 尽量在句读处截断，读起来像一句话而不是被砍掉半截
-  const head = t.slice(0, cap);
+  const head = safeSlice(t, cap);
   const cut = Math.max(head.lastIndexOf('。'), head.lastIndexOf('；'), head.lastIndexOf('！'), head.lastIndexOf('？'), head.lastIndexOf('. '));
-  if (cut > cap * 0.5) return head.slice(0, cut + 1);
+  if (cut > cap * 0.5) return safeSlice(head, cut + 1);
   return head + '…';
 }
 
@@ -286,8 +290,15 @@ function emptyWork(scope) {
 
 function normalizeWork(raw, scope) {
   if (!raw || typeof raw !== 'object') return null;
+  // v7.10.4：老数据里可能已经存了半个 emoji（升级前被写进来的）。读的时候清一次，
+  // 否则它会每轮重新进提示词，只能全靠 buildAIRequest 的出口兜底兜着。
   const turns = Array.isArray(raw.turns)
-    ? raw.turns.filter(t => t && typeof t === 'object' && (t.user || t.ai)).slice(-40)
+    ? raw.turns.filter(t => t && typeof t === 'object' && (t.user || t.ai)).slice(-40).map(t => {
+      const c = Object.assign({}, t);
+      if (typeof c.user === 'string') c.user = stripLoneSurrogates(c.user);
+      if (typeof c.ai === 'string') c.ai = stripLoneSurrogates(c.ai);
+      return c;
+    })
     : [];
   return {
     v: 1,
@@ -816,7 +827,8 @@ function formatLayeredMemory(layered, opts) {
   const epiBudget = total - workText.length - 2;   // 2 = 中间那个 '\n\n'
   const epiText = epiBudget >= 120 ? formatEpisodesBlock(layered.episodes, epiBudget) : '';
   const parts = [workText, epiText].filter(Boolean);
-  const text = parts.join('\n\n');
+  // v7.10.4：最后再兜一次，确保注入系统提示词的整段文本不含孤立代理项。
+  const text = stripLoneSurrogates(parts.join('\n\n'));
   return { text: text, chars: text.length };
 }
 
